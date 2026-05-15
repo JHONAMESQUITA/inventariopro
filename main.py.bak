@@ -1,0 +1,4234 @@
+import os
+import sys
+import smtplib
+import imaplib
+import email
+from email.header import decode_header
+import sqlite3
+import threading
+import gc
+import json
+import csv
+import traceback
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+from collections import defaultdict
+
+# ─────────────────────────────────────────────
+#  CAPTURA GLOBAL DE ERRORES — evita crashes silenciosos
+# ─────────────────────────────────────────────
+def _guardar_crash(tipo, valor, tb):
+    try:
+        ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+        with open(ruta, "w", encoding="utf-8") as f:
+            f.write(f"CRASH {datetime.now()}\n")
+            traceback.print_exception(tipo, valor, tb, file=f)
+    except Exception:
+        pass
+
+sys.excepthook = _guardar_crash
+
+# --- LIBRERÍAS OPCIONALES ---
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    pass
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+from kivy.app import App
+from kivy.lang import Builder
+from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.utils import platform, get_color_from_hex
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.checkbox import CheckBox
+from kivy.metrics import dp
+from kivy.core.window import Window
+from kivy.uix.popup import Popup
+from kivy.uix.textinput import TextInput
+from kivy.uix.spinner import Spinner
+from kivy.uix.scrollview import ScrollView
+from kivy.clock import Clock
+from kivy.graphics import Color, RoundedRectangle, Rectangle
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ─────────────────────────────────────────────
+#  CONFIGURACIÓN GLOBAL
+# ─────────────────────────────────────────────
+VERSION_ACTUAL = "3.0.0"
+URL_NUEVA_APK  = "https://tu-servidor.com/app_actualizada.apk"
+
+EMAIL_CONFIG = {
+    "remitente":     os.environ.get("APP_EMAIL",      "sleyderamesquita@gmail.com"),
+    "password":      os.environ.get("APP_EMAIL_PASS", "hwsguvteouceresu"),
+    "destinatarios": ["sleyderamesquita@gmail.com"],
+    "imap_servidor": "imap.gmail.com",
+    "imap_puerto":   993,
+    "asunto_filtro": "",
+    "remitente_filtro": "",
+}
+
+# ─────────────────────────────────────────────
+#  RUTAS ABSOLUTAS
+# ─────────────────────────────────────────────
+if platform == 'android':
+    from android.storage import app_storage_path
+    from android.permissions import request_permissions, Permission
+
+    DB_PATH    = os.path.join(app_storage_path(), "gestion_inventario.db")
+    EXPORT_DIR = "/storage/emulated/0/Download/InventarioPRO"
+
+    permisos = [Permission.INTERNET]
+    try:
+        from jnius import autoclass
+        Build = autoclass('android.os.Build$VERSION')
+        if Build.SDK_INT < 29:
+            permisos += [
+                Permission.WRITE_EXTERNAL_STORAGE,
+                Permission.READ_EXTERNAL_STORAGE,
+            ]
+    except Exception:
+        pass
+
+    request_permissions(permisos)
+else:
+    DB_PATH = "gestion_inventario.db"
+    import pathlib
+    _downloads = os.path.join(str(pathlib.Path.home()), "Downloads", "InventarioPRO")
+    EXPORT_DIR = _downloads
+
+try:
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+except Exception:
+    EXPORT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+Window.softinput_mode = 'below_target'
+
+# ─────────────────────────────────────────────
+#  BASE DE DATOS
+# ─────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS movimientos (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre         TEXT,
+        material       TEXT,
+        sku            TEXT,
+        cantidad       REAL,
+        tipo           TEXT,
+        fecha          TEXT,
+        stock_registro REAL,
+        dias           INTEGER,
+        retorno        TEXT DEFAULT "N/A",
+        notas          TEXT DEFAULT "",
+        ubicacion      TEXT DEFAULT ""
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS limpieza (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        material TEXT,
+        cantidad REAL,
+        estado   TEXT,
+        fecha    TEXT,
+        notas    TEXT DEFAULT ""
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS alertas_stock (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        material     TEXT UNIQUE,
+        stock_minimo REAL DEFAULT 5
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ubicaciones (
+        id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT UNIQUE
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS auditoria (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        accion    TEXT,
+        detalle   TEXT,
+        fecha     TEXT,
+        usuario   TEXT DEFAULT "sistema"
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS actualizaciones_correo (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        fecha        TEXT,
+        remitente    TEXT,
+        asunto       TEXT,
+        archivo      TEXT,
+        insertados   INTEGER,
+        omitidos     INTEGER,
+        errores      INTEGER
+    )''')
+    for tabla, columna, definicion in [
+        ("movimientos", "notas",    "TEXT DEFAULT ''"),
+        ("movimientos", "ubicacion","TEXT DEFAULT ''"),
+        ("limpieza",    "notas",    "TEXT DEFAULT ''"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {definicion}")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ─────────────────────────────────────────────
+#  UTILIDADES BD
+# ─────────────────────────────────────────────
+def db_query(sql, params=(), fetchall=True):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute(sql, params)
+        return c.fetchall() if fetchall else c.fetchone()
+    finally:
+        conn.close()
+
+def db_execute(sql, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute(sql, params)
+        conn.commit()
+        return c.lastrowid
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+def log_auditoria(accion, detalle):
+    try:
+        db_execute(
+            "INSERT INTO auditoria (accion, detalle, fecha) VALUES (?,?,?)",
+            (accion, detalle, datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+        )
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
+#  FUNCIONES NUEVAS — INVENTARIO DE ALQUILER
+# ═══════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────
+#  1. VALIDACIÓN CENTRALIZADA DE ENTRADAS
+# ─────────────────────────────────────────────
+def validar_movimiento(responsable, material, cantidad_str):
+    """
+    Valida los campos de un movimiento de alquiler.
+    Retorna (ok: bool, mensaje: str, cantidad: float).
+    """
+    resp = (responsable or "").strip().upper()
+    mat  = (material    or "").strip().upper()
+    cant_str = (cantidad_str or "").strip().replace(",", ".")
+
+    if not resp:
+        return False, "El responsable es obligatorio.", 0.0
+    if len(resp) < 2:
+        return False, "El nombre del responsable es demasiado corto.", 0.0
+    if not mat:
+        return False, "El equipo/material es obligatorio.", 0.0
+    if len(mat) < 2:
+        return False, "El nombre del equipo es demasiado corto.", 0.0
+    if not cant_str:
+        return False, "La cantidad es obligatoria.", 0.0
+    try:
+        cant = float(cant_str)
+    except ValueError:
+        return False, f"Cantidad inválida: '{cant_str}'. Usa números (ej. 2 o 1.5).", 0.0
+    if cant <= 0:
+        return False, "La cantidad debe ser mayor a 0.", 0.0
+    if cant > 9999:
+        return False, "Cantidad fuera de rango máximo (9999).", 0.0
+    return True, "OK", round(cant, 4)
+
+
+# ─────────────────────────────────────────────
+#  2. EQUIPOS ACTUALMENTE EN PRÉSTAMO
+# ─────────────────────────────────────────────
+def obtener_equipos_en_prestamo():
+    """
+    Devuelve lista de equipos actualmente fuera (salida sin retorno).
+    Cada elemento: dict con material, responsable, cantidad, fecha_salida,
+    dias_fuera, dias_acordados, sku, notas, estado_devolucion.
+    """
+    rows = db_query(
+        "SELECT nombre, material, sku, cantidad, tipo, fecha, dias, notas "
+        "FROM movimientos WHERE UPPER(nombre) != 'INVENTARIO' ORDER BY id ASC"
+    )
+    prestamos = {}
+    for n, m, s, c, t, f, d, notas in rows:
+        key = f"{str(n).upper()}|{str(m).upper()}"
+        if t == "SALIDA":
+            if key not in prestamos:
+                prestamos[key] = {
+                    "responsable":  str(n).upper(),
+                    "material":     str(m).upper(),
+                    "sku":          str(s or ""),
+                    "cantidad":     float(c),
+                    "fecha_salida": str(f),
+                    "dias_acordados": int(d or 0),
+                    "notas":        str(notas or ""),
+                }
+            else:
+                prestamos[key]["cantidad"] += float(c)
+        elif t == "ENTRADA" and key in prestamos:
+            prestamos[key]["cantidad"] -= float(c)
+            if prestamos[key]["cantidad"] <= 0:
+                del prestamos[key]
+
+    resultado = []
+    ahora = datetime.now()
+    for item in prestamos.values():
+        if item["cantidad"] <= 0:
+            continue
+        try:
+            fecha_dt = datetime.strptime(item["fecha_salida"][:16], "%d/%m/%Y %H:%M")
+            dias_fuera = (ahora - fecha_dt).days
+        except Exception:
+            dias_fuera = 0
+
+        dias_acordados = item["dias_acordados"]
+        if dias_acordados > 0 and dias_fuera > dias_acordados:
+            estado = "VENCIDO"
+        elif dias_acordados > 0 and dias_fuera >= dias_acordados - 1:
+            estado = "POR_VENCER"
+        else:
+            estado = "EN_TIEMPO"
+
+        resultado.append({**item, "dias_fuera": dias_fuera, "estado": estado})
+
+    orden = {"VENCIDO": 0, "POR_VENCER": 1, "EN_TIEMPO": 2}
+    resultado.sort(key=lambda x: (orden[x["estado"]], -x["dias_fuera"]))
+    return resultado
+
+
+# ─────────────────────────────────────────────
+#  3. HISTORIAL DE ALQUILER POR RESPONSABLE
+# ─────────────────────────────────────────────
+def historial_responsable(nombre):
+    nombre = nombre.strip().upper()
+    rows = db_query(
+        "SELECT material, sku, cantidad, tipo, fecha, dias, notas "
+        "FROM movimientos WHERE UPPER(nombre)=? ORDER BY id DESC",
+        (nombre,)
+    )
+    total_salidas  = sum(float(r[2]) for r in rows if r[3] == "SALIDA")
+    total_entradas = sum(float(r[2]) for r in rows if r[3] == "ENTRADA")
+    equipos_actuales = round(total_salidas - total_entradas, 4)
+
+    return {
+        "responsable":       nombre,
+        "movimientos":       rows,
+        "total_salidas":     round(total_salidas,  4),
+        "total_entradas":    round(total_entradas, 4),
+        "equipos_actuales":  max(0.0, equipos_actuales),
+        "num_operaciones":   len(rows),
+    }
+
+
+# ─────────────────────────────────────────────
+#  4. REPORTE DE VENCIMIENTOS
+# ─────────────────────────────────────────────
+def obtener_vencimientos(dias_alerta=1):
+    prestamos = obtener_equipos_en_prestamo()
+    vencidos    = [p for p in prestamos if p["estado"] == "VENCIDO"]
+    por_vencer  = [p for p in prestamos if p["estado"] == "POR_VENCER"]
+    return {"vencidos": vencidos, "por_vencer": por_vencer}
+
+
+# ─────────────────────────────────────────────
+#  5. EXPORTAR CSV DE ALQUILER
+# ─────────────────────────────────────────────
+def exportar_csv_alquiler(ruta=None):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rutas = []
+
+    ruta_movs = ruta or ruta_exportacion(f"movimientos_{ts}.csv")
+    try:
+        movs = db_query(
+            "SELECT id,nombre,material,sku,cantidad,tipo,fecha,"
+            "stock_registro,dias,retorno,notas,ubicacion "
+            "FROM movimientos ORDER BY id DESC"
+        )
+        with open(ruta_movs, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["ID","Responsable","Equipo","SKU","Cantidad","Tipo",
+                        "Fecha","Stock","Dias Acordados","Retorno","Notas","Ubicacion"])
+            w.writerows(movs)
+        rutas.append(ruta_movs)
+    except Exception:
+        pass
+
+    ruta_prestamos = ruta_exportacion(f"prestamos_activos_{ts}.csv")
+    try:
+        prestamos = obtener_equipos_en_prestamo()
+        with open(ruta_prestamos, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["Responsable","Equipo","SKU","Cantidad",
+                        "Fecha Salida","Dias Acordados","Dias Fuera","Estado","Notas"])
+            for p in prestamos:
+                w.writerow([
+                    p["responsable"], p["material"], p["sku"],
+                    p["cantidad"], p["fecha_salida"],
+                    p["dias_acordados"], p["dias_fuera"],
+                    p["estado"], p["notas"]
+                ])
+        rutas.append(ruta_prestamos)
+    except Exception:
+        pass
+
+    log_auditoria("EXPORTAR_CSV", f"{len(rutas)} archivos generados en {EXPORT_DIR}")
+    return rutas
+
+
+# ─────────────────────────────────────────────
+#  6. BACKUP CON ROTACIÓN AUTOMÁTICA
+# ─────────────────────────────────────────────
+def backup_con_rotacion(max_backups=5):
+    try:
+        nombre = ruta_exportacion(
+            f"backup_inventario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        generar_excel(nombre)
+
+        backups = sorted([
+            os.path.join(EXPORT_DIR, f)
+            for f in os.listdir(EXPORT_DIR)
+            if f.startswith("backup_inventario_") and f.endswith(".xlsx")
+        ])
+        while len(backups) > max_backups:
+            try:
+                os.remove(backups.pop(0))
+            except Exception:
+                pass
+
+        log_auditoria("BACKUP_ROTACION", f"Guardado: {nombre} | max={max_backups}")
+        return nombre
+    except Exception as e:
+        log_auditoria("BACKUP_ERROR", str(e))
+        return None
+
+
+# ─────────────────────────────────────────────
+#  7. DISPONIBILIDAD DE UN EQUIPO
+# ─────────────────────────────────────────────
+def consultar_disponibilidad(material):
+    material = material.strip().upper()
+    _, stock_disponible = obtener_stock_material(material)
+
+    prestamos_equipo = [
+        p for p in obtener_equipos_en_prestamo()
+        if p["material"] == material
+    ]
+    total_fuera = sum(p["cantidad"] for p in prestamos_equipo)
+
+    return {
+        "material":          material,
+        "stock_total":       stock_disponible + total_fuera,
+        "stock_disponible":  round(stock_disponible, 4),
+        "total_en_prestamo": round(total_fuera, 4),
+        "disponible":        stock_disponible > 0,
+        "prestamos":         prestamos_equipo,
+    }
+
+
+# ─────────────────────────────────────────────
+#  8. LIMPIEZA DE DUPLICADOS EN BD
+#  FIX: conn.close() movido dentro del bloque try/finally para
+#       garantizar que siempre se cierra la conexión
+# ─────────────────────────────────────────────
+def limpiar_duplicados():
+    """
+    Detecta y elimina registros exactamente duplicados en movimientos.
+    Retorna el número de duplicados eliminados.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM movimientos
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM movimientos
+                GROUP BY nombre, material, sku, cantidad, tipo, fecha
+            )
+        """)
+        eliminados = c.rowcount
+        conn.commit()
+        if eliminados:
+            log_auditoria("LIMPIAR_DUPLICADOS", f"{eliminados} duplicados eliminados")
+        return eliminados
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
+#  9. RESUMEN EJECUTIVO DIARIO
+# ─────────────────────────────────────────────
+def generar_resumen_diario():
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    movs_hoy = db_query(
+        f"SELECT COUNT(*) FROM movimientos WHERE fecha LIKE '{hoy}%'",
+        fetchall=False
+    )[0] or 0
+    ent_hoy = db_query(
+        f"SELECT COUNT(*) FROM movimientos WHERE tipo='ENTRADA' AND fecha LIKE '{hoy}%'",
+        fetchall=False
+    )[0] or 0
+    sal_hoy = db_query(
+        f"SELECT COUNT(*) FROM movimientos WHERE tipo='SALIDA' AND fecha LIKE '{hoy}%'",
+        fetchall=False
+    )[0] or 0
+
+    prestamos = obtener_equipos_en_prestamo()
+    vencidos   = [p for p in prestamos if p["estado"] == "VENCIDO"]
+    por_vencer = [p for p in prestamos if p["estado"] == "POR_VENCER"]
+    alertas    = obtener_alertas_activas()
+
+    lineas = [
+        f"=== RESUMEN DIARIO — {hoy} ===",
+        f"",
+        f"ACTIVIDAD HOY:",
+        f"  • Movimientos totales : {movs_hoy}",
+        f"  • Salidas (alquileres): {sal_hoy}",
+        f"  • Retornos            : {ent_hoy}",
+        f"",
+        f"ESTADO DE PRÉSTAMOS:",
+        f"  • Equipos en préstamo : {len(prestamos)}",
+        f"  • Vencidos            : {len(vencidos)}",
+        f"  • Próximos a vencer   : {len(por_vencer)}",
+        f"",
+    ]
+    if vencidos:
+        lineas.append("VENCIDOS (¡requieren atención!):")
+        for p in vencidos:
+            lineas.append(
+                f"  ! {p['material']} — {p['responsable']} "
+                f"({p['dias_fuera']} días fuera, acordado: {p['dias_acordados']})"
+            )
+        lineas.append("")
+    if alertas:
+        lineas.append("ALERTAS DE STOCK BAJO:")
+        for mat, disp, minimo in alertas:
+            lineas.append(f"  ! {mat}: {disp} disponibles (mínimo: {minimo})")
+        lineas.append("")
+    lineas.append(f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    lineas.append(f"— INVENTARIO PRO v{VERSION_ACTUAL}")
+    return "\n".join(lineas)
+
+
+# ─────────────────────────────────────────────
+#  10. ALERTA DE VENCIMIENTOS POR CORREO
+# ─────────────────────────────────────────────
+def enviar_alerta_vencimientos():
+    venc = obtener_vencimientos()
+    vencidos   = venc["vencidos"]
+    por_vencer = venc["por_vencer"]
+
+    if not vencidos and not por_vencer:
+        return True, "Sin vencimientos — no se envió correo."
+
+    cfg = EMAIL_CONFIG
+    if not cfg.get("password", "").strip():
+        return False, "Sin contraseña configurada en APP_EMAIL_PASS."
+
+    lineas = [
+        f"ALERTA DE VENCIMIENTOS — {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        "",
+    ]
+    if vencidos:
+        lineas.append(f"EQUIPOS CON RETORNO VENCIDO ({len(vencidos)}):")
+        for p in vencidos:
+            lineas.append(
+                f"  • {p['material']} — Responsable: {p['responsable']}"
+                f" | Días fuera: {p['dias_fuera']} (acordado: {p['dias_acordados']})"
+                f" | Salida: {p['fecha_salida']}"
+            )
+        lineas.append("")
+    if por_vencer:
+        lineas.append(f"PRÓXIMOS A VENCER ({len(por_vencer)}):")
+        for p in por_vencer:
+            lineas.append(
+                f"  • {p['material']} — Responsable: {p['responsable']}"
+                f" | Días fuera: {p['dias_fuera']} (acordado: {p['dias_acordados']})"
+            )
+        lineas.append("")
+    lineas.append(f"— INVENTARIO PRO v{VERSION_ACTUAL}")
+    cuerpo = "\n".join(lineas)
+
+    try:
+        msg = MIMEMultipart()
+        msg['From']    = cfg["remitente"]
+        msg['To']      = ", ".join(cfg["destinatarios"])
+        msg['Subject'] = (
+            f"⚠ ALERTA ALQUILER: {len(vencidos)} vencido(s), "
+            f"{len(por_vencer)} por vencer — {datetime.now().strftime('%d/%m/%Y')}"
+        )
+        msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
+        s = smtplib.SMTP('smtp.gmail.com', 587)
+        s.starttls()
+        s.login(cfg["remitente"], cfg["password"])
+        for dest in cfg["destinatarios"]:
+            s.sendmail(cfg["remitente"], dest, msg.as_string())
+        s.quit()
+        log_auditoria("ALERTA_VENCIMIENTOS_EMAIL",
+                      f"{len(vencidos)} vencidos, {len(por_vencer)} por vencer")
+        return True, "Alerta enviada correctamente."
+    except Exception as e:
+        return False, f"Error al enviar: {e}"
+
+
+# ─────────────────────────────────────────────
+#  LÓGICA DE NEGOCIO
+# ─────────────────────────────────────────────
+def obtener_stock_material(material):
+    material = material.strip().upper()
+    row = db_query(
+        "SELECT SUM(cantidad) FROM movimientos WHERE UPPER(material)=? AND UPPER(nombre)='INVENTARIO' AND tipo='ENTRADA'",
+        (material,), fetchall=False
+    )
+    stock_inv = float(row[0] or 0.0)
+    movs = db_query(
+        "SELECT tipo, cantidad FROM movimientos WHERE UPPER(material)=? AND UPPER(nombre)!='INVENTARIO'",
+        (material,)
+    )
+    delta = sum(float(c) if t == "ENTRADA" else -float(c) for t, c in movs)
+    return stock_inv, round(stock_inv + delta, 4)
+
+def obtener_alertas_activas():
+    alertas = db_query("SELECT material, stock_minimo FROM alertas_stock")
+    resultado = []
+    for mat, minimo in alertas:
+        _, disponible = obtener_stock_material(mat)
+        if disponible <= minimo:
+            resultado.append((mat, disponible, minimo))
+    return resultado
+
+def obtener_reporte_estadisticas():
+    total_movs          = db_query("SELECT COUNT(*) FROM movimientos", fetchall=False)[0] or 0
+    total_entradas      = db_query("SELECT COUNT(*) FROM movimientos WHERE tipo='ENTRADA'", fetchall=False)[0] or 0
+    total_salidas       = db_query("SELECT COUNT(*) FROM movimientos WHERE tipo='SALIDA'", fetchall=False)[0] or 0
+    materiales_unicos   = db_query("SELECT COUNT(DISTINCT material) FROM movimientos", fetchall=False)[0] or 0
+    responsables_unicos = db_query(
+        "SELECT COUNT(DISTINCT nombre) FROM movimientos WHERE UPPER(nombre)!='INVENTARIO'",
+        fetchall=False
+    )[0] or 0
+    top_mat = db_query(
+        "SELECT material, COUNT(*) as cnt FROM movimientos GROUP BY UPPER(material) ORDER BY cnt DESC LIMIT 1",
+        fetchall=False
+    )
+    material_top = top_mat[0] if top_mat else "N/A"
+    hace_7_dias  = (datetime.now() - timedelta(days=7)).strftime("%d/%m/%Y")
+    movs_recientes = db_query(
+        "SELECT COUNT(*) FROM movimientos WHERE fecha >= ?",
+        (hace_7_dias,), fetchall=False
+    )[0] or 0
+
+    hace_30_dias = (datetime.now() - timedelta(days=30)).strftime("%d/%m/%Y")
+    movs_30dias = db_query(
+        "SELECT COUNT(*) FROM movimientos WHERE fecha >= ?",
+        (hace_30_dias,), fetchall=False
+    )[0] or 0
+
+    ent_7d = db_query(
+        "SELECT COUNT(*) FROM movimientos WHERE tipo='ENTRADA' AND fecha >= ?",
+        (hace_7_dias,), fetchall=False
+    )[0] or 0
+    sal_7d = db_query(
+        "SELECT COUNT(*) FROM movimientos WHERE tipo='SALIDA' AND fecha >= ?",
+        (hace_7_dias,), fetchall=False
+    )[0] or 0
+
+    vol_entradas = db_query(
+        "SELECT COALESCE(SUM(cantidad), 0) FROM movimientos WHERE tipo='ENTRADA'",
+        fetchall=False
+    )[0] or 0
+    vol_salidas = db_query(
+        "SELECT COALESCE(SUM(cantidad), 0) FROM movimientos WHERE tipo='SALIDA'",
+        fetchall=False
+    )[0] or 0
+
+    prom_cant = db_query(
+        "SELECT COALESCE(AVG(cantidad), 0) FROM movimientos",
+        fetchall=False
+    )[0] or 0
+
+    top5_materiales = db_query(
+        "SELECT UPPER(material), COUNT(*) as cnt FROM movimientos "
+        "GROUP BY UPPER(material) ORDER BY cnt DESC LIMIT 5"
+    )
+
+    top5_responsables = db_query(
+        "SELECT UPPER(nombre), COUNT(*) as cnt FROM movimientos "
+        "WHERE UPPER(nombre)!='INVENTARIO' GROUP BY UPPER(nombre) ORDER BY cnt DESC LIMIT 5"
+    )
+
+    todos_mats = [r[0] for r in db_query("SELECT DISTINCT UPPER(material) FROM movimientos")]
+    mats_recientes = [r[0] for r in db_query(
+        "SELECT DISTINCT UPPER(material) FROM movimientos WHERE fecha >= ?",
+        (hace_30_dias,)
+    )]
+    mats_inactivos = [m for m in todos_mats if m not in mats_recientes]
+
+    total_limpieza = db_query("SELECT COUNT(*) FROM limpieza", fetchall=False)[0] or 0
+    limpios = db_query("SELECT COUNT(*) FROM limpieza WHERE UPPER(estado)='LIMPIO'", fetchall=False)[0] or 0
+    sucios  = db_query("SELECT COUNT(*) FROM limpieza WHERE UPPER(estado)='SUCIO'", fetchall=False)[0] or 0
+
+    primer_mov = db_query("SELECT fecha FROM movimientos ORDER BY id ASC LIMIT 1", fetchall=False)
+    ultimo_mov = db_query("SELECT fecha FROM movimientos ORDER BY id DESC LIMIT 1", fetchall=False)
+
+    return {
+        "total_movimientos": total_movs,
+        "entradas":          total_entradas,
+        "salidas":           total_salidas,
+        "materiales":        materiales_unicos,
+        "responsables":      responsables_unicos,
+        "material_top":      material_top,
+        "movs_7dias":        movs_recientes,
+        "movs_30dias":       movs_30dias,
+        "ent_7d":            ent_7d,
+        "sal_7d":            sal_7d,
+        "vol_entradas":      round(vol_entradas, 2),
+        "vol_salidas":       round(vol_salidas, 2),
+        "prom_cant":         round(prom_cant, 2),
+        "top5_materiales":   top5_materiales,
+        "top5_responsables": top5_responsables,
+        "mats_inactivos":    mats_inactivos[:10],
+        "total_limpieza":    total_limpieza,
+        "limpios":           limpios,
+        "sucios":            sucios,
+        "primer_mov":        primer_mov[0] if primer_mov else "N/A",
+        "ultimo_mov":        ultimo_mov[0] if ultimo_mov else "N/A",
+    }
+
+def ruta_exportacion(nombre_archivo):
+    try:
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(EXPORT_DIR, nombre_archivo)
+
+# ═══════════════════════════════════════════════════════════════
+#  ACTUALIZACIÓN DESDE CORREO ELECTRÓNICO
+# ═══════════════════════════════════════════════════════════════
+class ActualizadorCorreo:
+    EXTENSIONES = ('.xlsx', '.xls', '.xlsm')
+
+    def __init__(self, callback_progreso, callback_fin):
+        self.cb_prog = callback_progreso
+        self.cb_fin  = callback_fin
+
+    def ejecutar(self):
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        self._prog("Conectando al servidor de correo...")
+        try:
+            mail = imaplib.IMAP4_SSL(
+                EMAIL_CONFIG["imap_servidor"],
+                EMAIL_CONFIG["imap_puerto"]
+            )
+        except Exception as e:
+            self._fin(False, {"error": f"No se pudo conectar al servidor IMAP: {e}"})
+            return
+
+        self._prog("Iniciando sesion...")
+        if not str(EMAIL_CONFIG.get("password") or "").strip():
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._fin(False, {"error": "Falta la contraseña de correo.\n\n"
+                                       "Configura la variable de entorno APP_EMAIL_PASS "
+                                       "(contraseña de aplicación de Gmail)."})
+            return
+
+        try:
+            mail.login(EMAIL_CONFIG["remitente"], EMAIL_CONFIG["password"])
+        except imaplib.IMAP4.error as e:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._fin(False, {"error": f"Error de autenticación: {e}\n\n"
+                                       "Verifica que tienes habilitado el acceso IMAP en Gmail "
+                                       "y que usas una contraseña de aplicación."})
+            return
+
+        self._prog("Buscando correos con archivos Excel...")
+        try:
+            adjunto, meta = self._buscar_adjunto_excel(mail)
+        except Exception as e:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._fin(False, {"error": f"Error al buscar correos: {e}"})
+            return
+
+        if adjunto is None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._fin(False, {"error": "No se encontró ningún correo con un adjunto Excel.\n\n"
+                                       "Asegúrate de que el correo con el archivo llegó a la "
+                                       "bandeja de entrada de:\n" + EMAIL_CONFIG["remitente"]})
+            return
+
+        nombre_archivo = meta["nombre_archivo"]
+        self._prog(f"Descargando: {nombre_archivo}...")
+
+        ruta_local = ruta_exportacion(f"correo_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{nombre_archivo}")
+        try:
+            with open(ruta_local, "wb") as f:
+                f.write(adjunto)
+        except Exception as e:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._fin(False, {"error": f"No se pudo guardar el archivo descargado: {e}"})
+            return
+
+        self._prog("Importando datos al inventario...")
+        try:
+            resultado = self._importar_excel(ruta_local, meta)
+        except Exception as e:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._fin(False, {"error": f"Error al importar el Excel: {e}"})
+            return
+
+        try:
+            mail.select("INBOX")
+            mail.store(meta["uid"], '+FLAGS', '\\Seen')
+        except Exception:
+            pass
+
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+        try:
+            db_execute(
+                "INSERT INTO actualizaciones_correo "
+                "(fecha, remitente, asunto, archivo, insertados, omitidos, errores) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    meta.get("de", ""),
+                    meta.get("asunto", ""),
+                    nombre_archivo,
+                    resultado["insertados"],
+                    resultado["omitidos"],
+                    resultado["errores"],
+                )
+            )
+            log_auditoria("ACTUALIZAR_CORREO",
+                          f"{nombre_archivo} | +{resultado['insertados']} registros")
+        except Exception:
+            pass
+
+        self._fin(True, resultado)
+
+    # FIX: Lógica de detección de adjuntos simplificada y correcta.
+    # El original tenía una rama if/else que ejecutaba el mismo código en ambos caminos,
+    # lo que podía causar que se intentara procesar partes sin nombre de archivo.
+    def _buscar_adjunto_excel(self, mail):
+        mail.select("INBOX")
+
+        criterios = []
+        if EMAIL_CONFIG.get("asunto_filtro"):
+            criterios.append(f'SUBJECT "{EMAIL_CONFIG["asunto_filtro"]}"')
+        if EMAIL_CONFIG.get("remitente_filtro"):
+            criterios.append(f'FROM "{EMAIL_CONFIG["remitente_filtro"]}"')
+
+        if criterios:
+            criterio_str = "(" + " ".join(criterios) + ")"
+        else:
+            criterio_str = "UNSEEN"
+
+        _, data = mail.search(None, criterio_str)
+        uids = data[0].split()
+
+        if not uids and criterio_str == "UNSEEN":
+            fecha_desde = (datetime.now() - timedelta(days=30)).strftime("%d-%b-%Y")
+            _, data = mail.search(None, f'(SINCE "{fecha_desde}")')
+            uids = data[0].split()
+
+        if not uids:
+            return None, {}
+
+        for uid in reversed(uids):
+            _, msg_data = mail.fetch(uid, "(RFC822)")
+            if not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
+
+            de      = self._decodificar_header(msg.get("From", ""))
+            asunto  = self._decodificar_header(msg.get("Subject", ""))
+
+            for parte in msg.walk():
+                # FIX: Obtener el nombre del archivo directamente en un solo lugar.
+                # La lógica original duplicaba el bloque de código en if/else,
+                # procesando partes sin adjunto real.
+                filename = parte.get_filename()
+                if not filename:
+                    continue
+
+                nombre_dec = self._decodificar_header(filename)
+                if not nombre_dec.lower().endswith(self.EXTENSIONES):
+                    continue
+
+                payload = parte.get_payload(decode=True)
+                if not payload:
+                    continue
+
+                meta = {
+                    "uid":            uid,
+                    "de":             de,
+                    "asunto":         asunto,
+                    "nombre_archivo": nombre_dec,
+                }
+                return payload, meta
+
+        return None, {}
+
+    def _importar_excel(self, ruta_local, meta):
+        wb    = load_workbook(ruta_local, read_only=True, data_only=True)
+        hoja  = wb.sheetnames[0]
+        ws    = wb[hoja]
+        filas = list(ws.iter_rows(values_only=True))
+        wb.close()
+
+        if len(filas) < 2:
+            return {"insertados": 0, "omitidos": 0, "errores": 0,
+                    "nota": "El archivo no tiene filas de datos"}
+
+        encabezados = [str(h).strip() if h is not None else "" for h in filas[0]]
+        enc_upper   = [e.upper() for e in encabezados]
+
+        mapeo_campos = {
+            'nombre':   ['NOMBRE','RESPONSABLE','NAME','USUARIO','RESP'],
+            'material': ['MATERIAL','PRODUCTO','ITEM','DESCRIPCION','DESCRIPTION','MAT'],
+            'sku':      ['SKU','ID','CODIGO','CODE','REF'],
+            'cantidad': ['CANTIDAD','QTY','QUANTITY','CANT'],
+            'tipo':     ['TIPO','TYPE','MOVIMIENTO','MOVEMENT'],
+            'fecha':    ['FECHA','DATE','DATETIME','TIMESTAMP'],
+        }
+
+        indices = {}
+        for campo, alternativas in mapeo_campos.items():
+            for alt in alternativas:
+                if alt in enc_upper:
+                    indices[campo] = enc_upper.index(alt)
+                    break
+
+        if 'material' not in indices or 'cantidad' not in indices:
+            raise ValueError(
+                "No se encontraron las columnas obligatorias 'Material' y 'Cantidad'.\n"
+                f"Columnas detectadas: {', '.join(encabezados)}"
+            )
+
+        def celda(fila, campo):
+            i = indices.get(campo)
+            if i is None or i >= len(fila):
+                return None
+            return fila[i]
+
+        conn   = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        insertados = errores = omitidos = 0
+        ahora = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        for fila in filas[1:]:
+            try:
+                nombre   = str(celda(fila, 'nombre')   or "INVENTARIO").strip().upper()
+                material = str(celda(fila, 'material') or "").strip().upper()
+                sku      = str(celda(fila, 'sku')      or "").strip()
+                raw_cant = celda(fila, 'cantidad')
+                raw_tipo = str(celda(fila, 'tipo')     or "ENTRADA").strip().upper()
+                raw_fec  = celda(fila, 'fecha')
+
+                if not material:
+                    omitidos += 1
+                    continue
+
+                try:
+                    cantidad = float(str(raw_cant).replace(',', '.'))
+                except (TypeError, ValueError):
+                    omitidos += 1
+                    continue
+
+                if cantidad <= 0:
+                    omitidos += 1
+                    continue
+
+                if any(k in raw_tipo for k in ['ENT','IN','ING','COMP']):
+                    tipo = "ENTRADA"
+                elif any(k in raw_tipo for k in ['SAL','OUT','EGR','RET']):
+                    tipo = "SALIDA"
+                else:
+                    tipo = "ENTRADA"
+
+                if raw_fec is None:
+                    fecha = ahora
+                elif isinstance(raw_fec, datetime):
+                    fecha = raw_fec.strftime("%d/%m/%Y %H:%M")
+                else:
+                    fecha = str(raw_fec).strip() or ahora
+
+                cursor.execute(
+                    """SELECT 1 FROM movimientos
+                       WHERE nombre=? AND material=? AND sku=? AND cantidad=? AND tipo=? AND fecha=?
+                       LIMIT 1""",
+                    (nombre, material, sku, cantidad, tipo, fecha)
+                )
+                if cursor.fetchone():
+                    omitidos += 1
+                    continue
+
+                _, stock_actual = obtener_stock_material(material)
+                nuevo_stock = round(
+                    stock_actual + (cantidad if tipo == "ENTRADA" else -cantidad), 4
+                )
+
+                cursor.execute(
+                    '''INSERT INTO movimientos
+                       (nombre,material,sku,cantidad,tipo,fecha,stock_registro,dias,retorno,notas,ubicacion)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                    (nombre, material, sku, cantidad, tipo, fecha,
+                     nuevo_stock, 0, "N/A",
+                     f"Importado desde correo: {meta.get('asunto','')[:50]}", "")
+                )
+                insertados += 1
+
+            except Exception:
+                errores += 1
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "insertados": insertados,
+            "omitidos":   omitidos,
+            "errores":    errores,
+            "archivo":    meta.get("nombre_archivo", ""),
+            "de":         meta.get("de", ""),
+            "asunto":     meta.get("asunto", ""),
+        }
+
+    def _decodificar_header(self, valor):
+        if not valor:
+            return ""
+        partes = decode_header(valor)
+        resultado = []
+        for parte, enc in partes:
+            if isinstance(parte, bytes):
+                resultado.append(parte.decode(enc or "utf-8", errors="replace"))
+            else:
+                resultado.append(str(parte))
+        return "".join(resultado)
+
+    def _prog(self, texto):
+        Clock.schedule_once(lambda dt: self.cb_prog(texto))
+
+    def _fin(self, exito, datos):
+        Clock.schedule_once(lambda dt: self.cb_fin(exito, datos))
+
+
+# ─────────────────────────────────────────────
+#  GENERACIÓN EXCEL
+# ─────────────────────────────────────────────
+def generar_excel(ruta=None):
+    if ruta is None:
+        ruta = ruta_exportacion("Reporte_Inventario.xlsx")
+
+    wb = Workbook()
+    header_font  = Font(bold=True, color="FFFFFF", size=11)
+    header_fill  = PatternFill("solid", fgColor="1E3A5F")
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border  = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'),  bottom=Side(style='thin')
+    )
+    entrada_fill = PatternFill("solid", fgColor="D4EDDA")
+    salida_fill  = PatternFill("solid", fgColor="F8D7DA")
+    alerta_fill  = PatternFill("solid", fgColor="FFF3CD")
+
+    ws1 = wb.active
+    ws1.title = "Movimientos"
+    ws1.freeze_panes = "A2"
+    headers = ["#","Responsable","Material","SKU","Cantidad","Tipo","Fecha",
+               "Stock Registrado","Días","Retorno","Notas","Ubicación"]
+    ws1.append(headers)
+    for col_idx, _ in enumerate(headers, 1):
+        cell = ws1.cell(row=1, column=col_idx)
+        cell.font = header_font; cell.fill = header_fill
+        cell.alignment = center_align; cell.border = thin_border
+
+    movimientos = db_query(
+        "SELECT id,nombre,material,sku,cantidad,tipo,fecha,stock_registro,dias,retorno,notas,ubicacion FROM movimientos ORDER BY id DESC"
+    )
+    for row_data in movimientos:
+        ws1.append(row_data)
+        row_idx = ws1.max_row
+        fill = entrada_fill if row_data[5] == "ENTRADA" else salida_fill
+        for col_idx in range(1, len(headers)+1):
+            cell = ws1.cell(row=row_idx, column=col_idx)
+            cell.fill = fill; cell.border = thin_border
+            cell.alignment = Alignment(vertical="center")
+    widths = [5,20,20,12,10,10,18,15,8,10,25,15]
+    for col_idx, width in enumerate(widths, 1):
+        ws1.column_dimensions[chr(64+col_idx)].width = width
+
+    ws2 = wb.create_sheet("Stock Actual")
+    ws2.freeze_panes = "A2"
+    ws2.append(["Material","Stock Total Sistema","Stock Disponible Estante","Estado"])
+    for col_idx in range(1, 5):
+        cell = ws2.cell(row=1, column=col_idx)
+        cell.font = header_font; cell.fill = header_fill
+        cell.alignment = center_align; cell.border = thin_border
+    materiales   = db_query("SELECT DISTINCT UPPER(material) FROM movimientos ORDER BY material")
+    alertas_conf = {r[0].upper(): r[1] for r in db_query("SELECT material, stock_minimo FROM alertas_stock")}
+    for (mat,) in materiales:
+        fijo, disponible = obtener_stock_material(mat)
+        minimo = alertas_conf.get(mat, 5)
+        if disponible <= 0:        estado = "SIN STOCK"
+        elif disponible <= minimo: estado = "STOCK BAJO"
+        else:                      estado = "OK"
+        ws2.append([mat, fijo, disponible, estado])
+        row_idx  = ws2.max_row
+        fill_row = alerta_fill if "BAJO" in estado or "SIN" in estado else PatternFill("solid", fgColor="D4EDDA")
+        for col_idx in range(1, 5):
+            ws2.cell(row=row_idx, column=col_idx).fill = fill_row
+            ws2.cell(row=row_idx, column=col_idx).border = thin_border
+    for col_idx, width in enumerate([25,20,22,18], 1):
+        ws2.column_dimensions[chr(64+col_idx)].width = width
+
+    ws3 = wb.create_sheet("Limpieza")
+    ws3.append(["Material","Cantidad","Estado","Fecha","Notas"])
+    for col_idx in range(1, 6):
+        cell = ws3.cell(row=1, column=col_idx)
+        cell.font = header_font; cell.fill = header_fill
+        cell.alignment = center_align; cell.border = thin_border
+    for row_data in db_query("SELECT material,cantidad,estado,fecha,notas FROM limpieza ORDER BY id DESC"):
+        ws3.append(row_data)
+        row_idx = ws3.max_row
+        f = PatternFill("solid", fgColor="D4EDDA") if row_data[2] == "LIMPIO" else PatternFill("solid", fgColor="FFF3CD")
+        for col_idx in range(1, 6):
+            ws3.cell(row=row_idx, column=col_idx).fill = f
+            ws3.cell(row=row_idx, column=col_idx).border = thin_border
+
+    ws4 = wb.create_sheet("Estadísticas")
+    stats = obtener_reporte_estadisticas()
+    ws4["A1"] = "RESUMEN EJECUTIVO"
+    ws4["A1"].font = Font(bold=True, size=14, color="1E3A5F")
+    ws4["A3"] = "Indicador"; ws4["B3"] = "Valor"
+    for cell in [ws4["A3"], ws4["B3"]]:
+        cell.font = header_font; cell.fill = header_fill
+    filas = [
+        ("Total de Movimientos",       stats["total_movimientos"]),
+        ("Entradas Registradas",        stats["entradas"]),
+        ("Salidas Registradas",         stats["salidas"]),
+        ("Materiales Distintos",        stats["materiales"]),
+        ("Responsables Activos",        stats["responsables"]),
+        ("Material Más Movido",         stats["material_top"]),
+        ("Movimientos (últimos 7 días)",stats["movs_7dias"]),
+        ("Reporte Generado",            datetime.now().strftime("%d/%m/%Y %H:%M")),
+    ]
+    for i, (indicador, valor) in enumerate(filas, start=4):
+        ws4.cell(row=i, column=1, value=indicador).border = thin_border
+        ws4.cell(row=i, column=2, value=valor).border     = thin_border
+    ws4.column_dimensions["A"].width = 30
+    ws4.column_dimensions["B"].width = 20
+    wb.save(ruta)
+    return ruta
+
+# ─────────────────────────────────────────────
+#  WIDGET AUXILIAR — TARJETA
+# ─────────────────────────────────────────────
+def crear_tarjeta(altura=dp(90), color='#1E293B', radius=dp(12)):
+    card = BoxLayout(orientation='vertical', size_hint_y=None, height=altura, padding=dp(10))
+    with card.canvas.before:
+        Color(rgba=get_color_from_hex(color))
+        card._rect = RoundedRectangle(pos=card.pos, size=card.size, radius=[radius])
+    def _upd(inst, val):
+        inst._rect.pos  = inst.pos
+        inst._rect.size = inst.size
+    card.bind(pos=_upd, size=_upd)
+    return card
+
+# ─────────────────────────────────────────────
+#  EXPLORADOR DE ARCHIVOS VISUAL
+# ─────────────────────────────────────────────
+class ExploradorArchivos(Popup):
+    EXTENSIONES_EXCEL = ('.xlsx', '.xls', '.xlsm', '.xlsb')
+
+    def __init__(self, callback, **kwargs):
+        super().__init__(**kwargs)
+        self.callback    = callback
+        self.title       = "Seleccionar archivo Excel"
+        self.size_hint   = (0.97, 0.93)
+        self.ruta_actual = self._ruta_inicial()
+
+        root_layout = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(8))
+
+        accesos = [("Mis Reportes (app)", EXPORT_DIR)]
+        if platform == 'android':
+            accesos += [
+                ("Descargas",    "/storage/emulated/0/Download"),
+                ("Documentos",   "/storage/emulated/0/Documents"),
+                ("WhatsApp",     "/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents"),
+                ("Telegram",     "/storage/emulated/0/Android/media/org.telegram.messenger/Telegram/Telegram Documents"),
+                ("Raiz",         "/storage/emulated/0"),
+            ]
+        else:
+            import pathlib
+            accesos += [
+                ("Descargas",    os.path.join(str(pathlib.Path.home()), "Downloads")),
+                ("Inicio",       str(pathlib.Path.home())),
+            ]
+
+        atajos_scroll = ScrollView(size_hint_y=None, height=dp(48), do_scroll_y=False)
+        atajos_box    = BoxLayout(size_hint_x=None, spacing=dp(6))
+        atajos_box.bind(minimum_width=atajos_box.setter('width'))
+        for nombre, ruta in accesos:
+            if os.path.exists(ruta):
+                btn = Button(
+                    text=nombre, size_hint=(None, 1), width=dp(150),
+                    font_size='12sp', background_color=get_color_from_hex('#1E40AF')
+                )
+                btn.bind(on_release=lambda x, r=ruta: self.listar(r))
+                atajos_box.add_widget(btn)
+        atajos_scroll.add_widget(atajos_box)
+        root_layout.add_widget(atajos_scroll)
+
+        self.lbl_ruta = Label(
+            text=self.ruta_actual, size_hint_y=None, height=dp(30),
+            font_size='11sp', color=get_color_from_hex('#94A3B8'),
+            halign='left', shorten=True, shorten_from='left',
+            text_size=(Window.width * 0.92, None)
+        )
+        root_layout.add_widget(self.lbl_ruta)
+
+        self.filtro = TextInput(
+            hint_text='Filtrar archivos...', multiline=False,
+            size_hint_y=None, height=dp(42)
+        )
+        self.filtro.bind(text=lambda inst, val: self.listar(self.ruta_actual))
+        root_layout.add_widget(self.filtro)
+
+        self.lbl_debug = Label(
+            text='', size_hint_y=None, height=dp(24), font_size='11sp',
+            color=get_color_from_hex('#F59E0B'), halign='left',
+            text_size=(Window.width * 0.92, None)
+        )
+        root_layout.add_widget(self.lbl_debug)
+
+        self.scroll = ScrollView()
+        self.lista  = GridLayout(cols=1, size_hint_y=None, spacing=dp(5))
+        self.lista.bind(minimum_height=self.lista.setter('height'))
+        self.scroll.add_widget(self.lista)
+        root_layout.add_widget(self.scroll)
+
+        btns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        btn_back = Button(text='SUBIR NIVEL', background_color=get_color_from_hex('#334155'), font_size='13sp')
+        btn_back.bind(on_release=lambda x: self.subir_nivel())
+        btns.add_widget(btn_back)
+        btn_cerrar = Button(text='CANCELAR', background_color=get_color_from_hex('#7F1D1D'), font_size='13sp')
+        btn_cerrar.bind(on_release=self.dismiss)
+        btns.add_widget(btn_cerrar)
+        root_layout.add_widget(btns)
+        self.content = root_layout
+        self.listar(self.ruta_actual)
+
+    def _ruta_inicial(self):
+        if os.path.exists(EXPORT_DIR):
+            return EXPORT_DIR
+        if platform == 'android':
+            for r in ['/storage/emulated/0/Download', '/storage/emulated/0']:
+                if os.path.exists(r): return r
+        import pathlib
+        descargas = os.path.join(str(pathlib.Path.home()), 'Downloads')
+        return descargas if os.path.exists(descargas) else str(pathlib.Path.home())
+
+    def listar(self, ruta):
+        self.lista.clear_widgets()
+        self.lbl_ruta.text = ruta
+        self.ruta_actual   = ruta
+        filtro_txt = self.filtro.text.lower().strip() if hasattr(self, 'filtro') else ''
+        try:
+            entradas = sorted(os.listdir(ruta))
+        except PermissionError:
+            self.lista.add_widget(Label(
+                text='Sin permiso para acceder a esta carpeta',
+                color=get_color_from_hex('#F87171'), size_hint_y=None, height=dp(60), halign='center'
+            ))
+            return
+        except Exception as e:
+            self.lista.add_widget(Label(text=f'Error: {e}', color=get_color_from_hex('#F87171'), size_hint_y=None, height=dp(50)))
+            return
+
+        carpetas = []; archivos = []; total_enc = 0
+        for nombre in entradas:
+            ns = nombre.strip()
+            if ns.startswith('.'): continue
+            rc = os.path.join(ruta, ns)
+            if filtro_txt and filtro_txt not in ns.lower(): continue
+            try:
+                es_dir = os.path.isdir(rc)
+            except Exception:
+                continue
+            if es_dir:
+                carpetas.append((ns, rc))
+            elif ns.lower().endswith(self.EXTENSIONES_EXCEL):
+                archivos.append((ns, rc)); total_enc += 1
+
+        total_en_carpeta = len([n for n in entradas if not n.startswith('.')])
+        if hasattr(self, 'lbl_debug'):
+            self.lbl_debug.text = f"{total_en_carpeta} entradas  |  {len(carpetas)} carpetas  |  {total_enc} Excel encontrado(s)"
+
+        if not carpetas and not archivos:
+            self.lista.add_widget(Label(
+                text='No hay archivos Excel en esta carpeta',
+                color=get_color_from_hex('#94A3B8'), size_hint_y=None, height=dp(50), halign='center'
+            ))
+            return
+
+        for ns, rc in carpetas:
+            btn = Button(text=f'DIR  {ns}', size_hint_y=None, height=dp(52), halign='left',
+                         font_size='13sp', background_color=get_color_from_hex('#1E3A5F'))
+            btn.bind(on_release=lambda x, r=rc: self.listar(r))
+            self.lista.add_widget(btn)
+
+        for ns, rc in archivos:
+            try:    size_txt = f'{os.path.getsize(rc)/1024:.1f} KB'
+            except: size_txt = ''
+            btn = Button(
+                text=f'XLS  {ns}\n[size=11sp][color=#94A3B8]{size_txt}[/color][/size]',
+                markup=True, size_hint_y=None, height=dp(60), halign='left',
+                font_size='13sp', background_color=get_color_from_hex('#065F46')
+            )
+            btn.bind(on_release=lambda x, r=rc: self._seleccionar(r))
+            self.lista.add_widget(btn)
+
+    def subir_nivel(self):
+        padre = os.path.dirname(self.ruta_actual)
+        if padre and padre != self.ruta_actual: self.listar(padre)
+
+    def _seleccionar(self, ruta):
+        self.dismiss()
+        Clock.schedule_once(lambda dt: self.callback(ruta), 0.15)
+
+
+# ─────────────────────────────────────────────
+#  KV — INTERFAZ
+# ─────────────────────────────────────────────
+KV = '''
+#:import utils kivy.utils
+#:import dp kivy.metrics.dp
+
+<Button>:
+    background_normal: ''
+    background_down: ''
+    canvas.before:
+        Color:
+            rgba: self.background_color if self.state == 'normal' else [c * 0.8 for c in self.background_color]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+
+<TextInput>:
+    background_normal: ''
+    background_active: ''
+    background_color: utils.get_color_from_hex('#0F172A')
+    foreground_color: utils.get_color_from_hex('#F8FAFC')
+    cursor_color: utils.get_color_from_hex('#38BDF8')
+    hint_text_color: utils.get_color_from_hex('#64748B')
+    padding: [dp(10), (self.height - self.line_height) / 2]
+    canvas.after:
+        Color:
+            rgba: utils.get_color_from_hex('#38BDF8') if self.focus else utils.get_color_from_hex('#334155')
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(8))
+            width: dp(1.2) if self.focus else dp(1)
+
+<SpinnerOption>:
+    background_normal: ''
+    background_color: utils.get_color_from_hex('#1E293B')
+    color: utils.get_color_from_hex('#F8FAFC')
+    font_size: '13sp'
+
+<Spinner>:
+    background_normal: ''
+    background_down: ''
+    background_color: utils.get_color_from_hex('#334155')
+    color: utils.get_color_from_hex('#E2E8F0')
+    font_size: '13sp'
+    option_cls: 'SpinnerOption'
+    canvas.before:
+        Color:
+            rgba: self.background_color
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+
+<InventarioScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(8)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            spacing: dp(8)
+            padding: [dp(5), 0]
+            Label:
+                text: "📦 INVENTARIO PRO"
+                font_size: '20sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#F8FAFC')
+            Label:
+                text: "v3.0"
+                size_hint_x: None
+                width: dp(40)
+                font_size: '10sp'
+                color: utils.get_color_from_hex('#475569')
+                valign: 'middle'
+                halign: 'center'
+                text_size: self.size
+            Button:
+                id: btn_alertas
+                text: "🔔 ALERTAS"
+                size_hint_x: None
+                width: dp(90)
+                font_size: '12sp'
+                bold: True
+                background_color: utils.get_color_from_hex('#1E293B')
+                on_release: root.mostrar_alertas()
+
+        ScrollView:
+            do_scroll_x: False
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(15)
+                padding: [0, dp(10)]
+
+                # TARJETA 0: RESUMEN / DASHBOARD
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(200)
+                    padding: dp(15)
+                    spacing: dp(10)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(16)]
+
+                    Label:
+                        id: lbl_saludo
+                        text: "Buenos días"
+                        font_size: '14sp'
+                        color: utils.get_color_from_hex('#94A3B8')
+                        size_hint_y: None
+                        height: dp(22)
+                        text_size: self.size
+                        halign: 'left'
+
+                    Label:
+                        id: lbl_fecha_hoy
+                        text: ""
+                        font_size: '11sp'
+                        color: utils.get_color_from_hex('#64748B')
+                        size_hint_y: None
+                        height: dp(18)
+                        text_size: self.size
+                        halign: 'left'
+
+                    BoxLayout:
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: dp(80)
+
+                        BoxLayout:
+                            orientation: 'vertical'
+                            canvas.before:
+                                Color:
+                                    rgba: utils.get_color_from_hex('#0F172A')
+                                RoundedRectangle:
+                                    pos: self.pos
+                                    size: self.size
+                                    radius: [dp(12)]
+                            padding: dp(10)
+                            Label:
+                                id: stat_materiales
+                                text: "0"
+                                font_size: '22sp'
+                                bold: True
+                                color: utils.get_color_from_hex('#38BDF8')
+                            Label:
+                                text: "Materiales"
+                                font_size: '10sp'
+                                color: utils.get_color_from_hex('#64748B')
+
+                        BoxLayout:
+                            orientation: 'vertical'
+                            canvas.before:
+                                Color:
+                                    rgba: utils.get_color_from_hex('#0F172A')
+                                RoundedRectangle:
+                                    pos: self.pos
+                                    size: self.size
+                                    radius: [dp(12)]
+                            padding: dp(10)
+                            Label:
+                                id: stat_movs_hoy
+                                text: "0"
+                                font_size: '22sp'
+                                bold: True
+                                color: utils.get_color_from_hex('#10B981')
+                            Label:
+                                text: "Movimientos hoy"
+                                font_size: '10sp'
+                                color: utils.get_color_from_hex('#64748B')
+
+                        BoxLayout:
+                            orientation: 'vertical'
+                            canvas.before:
+                                Color:
+                                    rgba: utils.get_color_from_hex('#0F172A')
+                                RoundedRectangle:
+                                    pos: self.pos
+                                    size: self.size
+                                    radius: [dp(12)]
+                            padding: dp(10)
+                            Label:
+                                id: stat_alertas
+                                text: "0"
+                                font_size: '22sp'
+                                bold: True
+                                color: utils.get_color_from_hex('#F59E0B')
+                            Label:
+                                text: "Alertas"
+                                font_size: '10sp'
+                                color: utils.get_color_from_hex('#64748B')
+
+                        BoxLayout:
+                            orientation: 'vertical'
+                            canvas.before:
+                                Color:
+                                    rgba: utils.get_color_from_hex('#0F172A')
+                                RoundedRectangle:
+                                    pos: self.pos
+                                    size: self.size
+                                    radius: [dp(12)]
+                            padding: dp(10)
+                            Label:
+                                id: stat_pendientes
+                                text: "0"
+                                font_size: '22sp'
+                                bold: True
+                                color: utils.get_color_from_hex('#F87171')
+                            Label:
+                                text: "Fuera"
+                                font_size: '10sp'
+                                color: utils.get_color_from_hex('#64748B')
+
+                    Label:
+                        id: lbl_resumen_db
+                        text: ""
+                        font_size: '10sp'
+                        color: utils.get_color_from_hex('#475569')
+                        size_hint_y: None
+                        height: dp(16)
+                        text_size: self.size
+                        halign: 'right'
+
+                # TARJETA — ACTIVIDAD RECIENTE
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(220)
+                    padding: dp(15)
+                    spacing: dp(6)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(16)]
+
+                    Label:
+                        text: "ACTIVIDAD RECIENTE"
+                        bold: True
+                        font_size: '12sp'
+                        color: utils.get_color_from_hex('#10B981')
+                        size_hint_y: None
+                        height: dp(22)
+                        text_size: self.size
+                        halign: 'left'
+
+                    GridLayout:
+                        id: actividad_reciente
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: dp(3)
+
+                # TARJETA 1: REGISTRO DE MOVIMIENTOS
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: dp(8)
+                    padding: dp(15)
+                    size_hint_y: None
+                    height: dp(680)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(16)]
+
+                    Label:
+                        text: "NUEVO MOVIMIENTO"
+                        bold: True
+                        font_size: '12sp'
+                        color: utils.get_color_from_hex('#38BDF8')
+                        size_hint_y: None
+                        height: dp(20)
+                        text_size: self.size
+                        halign: 'left'
+
+                    Spinner:
+                        id: responsable_spinner
+                        text: "SELECCIONAR RESPONSABLE"
+                        values: []
+                        size_hint_y: None
+                        height: dp(45)
+                    TextInput:
+                        id: nombre_nuevo
+                        hint_text: "O escribe nuevo responsable..."
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(45)
+                    Spinner:
+                        id: producto_spinner
+                        text: "SELECCIONAR MATERIAL"
+                        values: []
+                        size_hint_y: None
+                        height: dp(45)
+                    TextInput:
+                        id: producto_nuevo
+                        hint_text: "O escribe material nuevo..."
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(45)
+                    BoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(45)
+                        TextInput:
+                            id: sku
+                            hint_text: "SKU / ID"
+                            multiline: False
+                        TextInput:
+                            id: cantidad
+                            hint_text: "Cantidad"
+                            input_filter: 'float'
+                            multiline: False
+                    BoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(45)
+                        TextInput:
+                            id: d_p
+                            hint_text: "Días (salida)"
+                            input_filter: 'int'
+                            multiline: False
+                        TextInput:
+                            id: ubicacion
+                            hint_text: "Ubicación"
+                            multiline: False
+                    TextInput:
+                        id: f_m
+                        hint_text: "Fecha Manual (dd/mm/aaaa hh:mm)"
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(45)
+                    TextInput:
+                        id: notas
+                        hint_text: "Notas / Observaciones..."
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(45)
+                    BoxLayout:
+                        size_hint_y: None
+                        height: dp(38)
+                        spacing: dp(8)
+                        CheckBox:
+                            id: c_l
+                            active: False
+                            size_hint_x: None
+                            width: dp(40)
+                        Label:
+                            text: "Enviar a Limpieza (solo INVENTARIO)"
+                            halign: 'left'
+                            valign: 'middle'
+                            text_size: self.size
+                            font_size: '13sp'
+                            color: utils.get_color_from_hex('#94A3B8')
+                    Button:
+                        text: "LIMPIAR CAMPOS"
+                        size_hint_y: None
+                        height: dp(40)
+                        background_color: utils.get_color_from_hex('#334155')
+                        on_release: root.limpiar_campos()
+
+                Label:
+                    id: info_carpeta
+                    text: ""
+                    color: utils.get_color_from_hex('#475569')
+                    markup: True
+                    font_size: '10sp'
+                    size_hint_y: None
+                    height: dp(20)
+
+                Label:
+                    id: info
+                    text: "Listo"
+                    color: utils.get_color_from_hex('#94A3B8')
+                    markup: True
+                    size_hint_y: None
+                    height: dp(32)
+
+                # TARJETA 2: ACCIONES RÁPIDAS
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(120)
+                    padding: dp(15)
+                    spacing: dp(10)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(16)]
+                    
+                    Label:
+                        text: "ACCIONES RÁPIDAS"
+                        bold: True
+                        font_size: '12sp'
+                        color: utils.get_color_from_hex('#38BDF8')
+                        size_hint_y: None
+                        height: dp(20)
+                        text_size: self.size
+                        halign: 'left'
+
+                    BoxLayout:
+                        spacing: dp(12)
+                        Button:
+                            text: "▲ ENTRADA"
+                            font_size: '15sp'
+                            bold: True
+                            on_release: root.procesar("ENTRADA")
+                            background_color: utils.get_color_from_hex('#059669')
+                        Button:
+                            text: "▼ SALIDA"
+                            font_size: '15sp'
+                            bold: True
+                            on_release: root.procesar("SALIDA")
+                            background_color: utils.get_color_from_hex('#DC2626')
+
+                # TARJETA 3: HERRAMIENTAS Y REPORTES
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(480)
+                    padding: dp(15)
+                    spacing: dp(10)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(16)]
+
+                    Label:
+                        text: "HERRAMIENTAS"
+                        bold: True
+                        font_size: '12sp'
+                        color: utils.get_color_from_hex('#38BDF8')
+                        size_hint_y: None
+                        height: dp(20)
+                        text_size: self.size
+                        halign: 'left'
+
+                    GridLayout:
+                        cols: 2
+                        spacing: dp(10)
+                        height: dp(405)
+                        Button:
+                            text: "📦 FUERA"
+                            background_color: utils.get_color_from_hex('#1E40AF')
+                            on_release: root.manager.current = 'pendientes'
+                        Button:
+                            text: "📋 AUDITORIA"
+                            background_color: utils.get_color_from_hex('#1E40AF')
+                            on_release: root.manager.current = 'filtros'
+                        Button:
+                            text: "📊 STOCK"
+                            background_color: utils.get_color_from_hex('#1E40AF')
+                            on_release: root.manager.current = 'stock'
+                        Button:
+                            text: "🧹 LIMPIEZA"
+                            background_color: utils.get_color_from_hex('#1E40AF')
+                            on_release: root.manager.current = 'limpieza'
+                        Button:
+                            text: "📈 ESTADISTICAS"
+                            background_color: utils.get_color_from_hex('#1E40AF')
+                            on_release: root.manager.current = 'estadisticas'
+                        Button:
+                            text: "⚙️ AJUSTES"
+                            background_color: utils.get_color_from_hex('#1E40AF')
+                            on_release: root.manager.current = 'ajustes'
+                        Button:
+                            text: "📤 EXPORTAR"
+                            background_color: utils.get_color_from_hex('#7C3AED')
+                            on_release: root.enviar_correo()
+                        Button:
+                            text: "💾 BACKUP"
+                            background_color: utils.get_color_from_hex('#7C3AED')
+                            on_release: root.hacer_backup()
+                        Button:
+                            text: "📥 IMPORTAR EXCEL"
+                            background_color: utils.get_color_from_hex('#065F46')
+                            on_release: root.manager.current = 'importar'
+                        Button:
+                            id: btn_actualizar_correo
+                            text: "📧 ACTUALIZAR DEL CORREO"
+                            markup: False
+                            background_color: utils.get_color_from_hex('#0E7490')
+                            font_size: '13sp'
+                            bold: True
+                            on_release: root.actualizar_desde_correo()
+
+
+<LimpiezaScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            padding: [dp(5), 0]
+            Label:
+                text: "🧹 CONTROL DE LIMPIEZA"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#A78BFA')
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(310)
+            spacing: dp(8)
+            padding: dp(15)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#1E293B')
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(16)]
+
+            Label:
+                text: "REGISTRAR ESTADO"
+                bold: True
+                font_size: '12sp'
+                color: utils.get_color_from_hex('#A78BFA')
+                size_hint_y: None
+                height: dp(20)
+                text_size: self.size
+                halign: 'left'
+
+            Spinner:
+                id: limpieza_spinner
+                text: "SELECCIONAR MATERIAL"
+                values: []
+                size_hint_y: None
+                height: dp(45)
+            TextInput:
+                id: m_n
+                hint_text: "O escribe material..."
+                multiline: False
+                size_hint_y: None
+                height: dp(45)
+            TextInput:
+                id: m_c
+                hint_text: "Cantidad"
+                input_filter: 'float'
+                multiline: False
+                size_hint_y: None
+                height: dp(45)
+            TextInput:
+                id: m_notas
+                hint_text: "Notas..."
+                multiline: False
+                size_hint_y: None
+                height: dp(45)
+            BoxLayout:
+                spacing: dp(10)
+                size_hint_y: None
+                height: dp(50)
+                Button:
+                    text: "LIMPIO"
+                    bold: True
+                    background_color: utils.get_color_from_hex('#10B981')
+                    on_release: root.registrar_limpieza("LIMPIO")
+                Button:
+                    text: "SYNC SUCIO"
+                    bold: True
+                    background_color: utils.get_color_from_hex('#F59E0B')
+                    on_release: root.registrar_limpieza("SUCIO")
+
+        Label:
+            id: info_limpieza
+            text: ""
+            color: utils.get_color_from_hex('#F87171')
+            size_hint_y: None
+            height: dp(22)
+
+        TextInput:
+            id: f_l
+            hint_text: "Filtrar historial..."
+            multiline: False
+            size_hint_y: None
+            height: dp(45)
+            on_text: root.consultar_historial()
+
+        ScrollView:
+            GridLayout:
+                id: hist_limpieza
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(10)
+
+        Button:
+            text: "←  VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+
+<PendientesScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            spacing: dp(8)
+            padding: [dp(5), 0]
+            Label:
+                text: "📦 MATERIALES FUERA"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#F87171')
+            Button:
+                text: "SYNC"
+                size_hint_x: None
+                width: dp(45)
+                background_color: utils.get_color_from_hex('#334155')
+                on_release: root.cargar_pendientes()
+
+        TextInput:
+            id: filtro_pendientes
+            hint_text: "Filtrar por responsable o material..."
+            multiline: False
+            size_hint_y: None
+            height: dp(45)
+            on_text: root.cargar_pendientes()
+
+        ScrollView:
+            GridLayout:
+                id: lista_pendientes
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(12)
+
+        Button:
+            text: "←  VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+
+<FiltroScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            padding: [dp(5), 0]
+            Label:
+                text: "📋 AUDITORIA DE MOVIMIENTOS"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#38BDF8')
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(175)
+            spacing: dp(6)
+            padding: dp(15)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#1E293B')
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(16)]
+
+            Label:
+                text: "FILTROS"
+                bold: True
+                font_size: '12sp'
+                color: utils.get_color_from_hex('#38BDF8')
+                size_hint_y: None
+                height: dp(20)
+                text_size: self.size
+                halign: 'left'
+
+            TextInput:
+                id: f_n
+                hint_text: "Filtrar por Responsable..."
+                multiline: False
+                size_hint_y: None
+                height: dp(42)
+                on_text: root.filtrar()
+            TextInput:
+                id: f_p
+                hint_text: "Filtrar por Material..."
+                multiline: False
+                size_hint_y: None
+                height: dp(42)
+                on_text: root.filtrar()
+            Spinner:
+                id: filtro_tipo
+                text: "TODOS LOS TIPOS"
+                values: ["TODOS LOS TIPOS", "ENTRADA", "SALIDA"]
+                size_hint_y: None
+                height: dp(42)
+                on_text: root.filtrar()
+
+        Label:
+            id: filtro_count
+            text: ""
+            color: utils.get_color_from_hex('#94A3B8')
+            size_hint_y: None
+            height: dp(25)
+
+        ScrollView:
+            GridLayout:
+                id: c_r
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(8)
+
+        Button:
+            text: "←  VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+
+<StockScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            padding: [dp(5), 0]
+            Label:
+                text: "📊 ESTADO DE STOCK"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#38BDF8')
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(45)
+            spacing: dp(5)
+            Spinner:
+                id: stock_spinner
+                text: "BUSCAR MATERIAL"
+                values: []
+                on_text: root.consultar()
+            Button:
+                text: ""
+                size_hint_x: None
+                width: dp(45)
+                background_color: utils.get_color_from_hex('#334155')
+                on_release: root.consultar()
+
+        TextInput:
+            id: f_s
+            hint_text: " Escribe para filtrar..."
+            multiline: False
+            size_hint_y: None
+            height: dp(45)
+            on_text: root.consultar()
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(35)
+            spacing: dp(5)
+            Button:
+                text: "TODO"
+                font_size: '12sp'
+                background_color: utils.get_color_from_hex('#334155')
+                on_release: root.set_filtro_estado("")
+            Button:
+                text: " SIN STOCK"
+                font_size: '12sp'
+                background_color: utils.get_color_from_hex('#EF4444')
+                on_release: root.set_filtro_estado("sin_stock")
+            Button:
+                text: " BAJO"
+                font_size: '12sp'
+                background_color: utils.get_color_from_hex('#F59E0B')
+                on_release: root.set_filtro_estado("bajo")
+            Button:
+                text: " OK"
+                font_size: '12sp'
+                background_color: utils.get_color_from_hex('#059669')
+                on_release: root.set_filtro_estado("ok")
+
+        ScrollView:
+            GridLayout:
+                id: s_r
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(10)
+
+        Button:
+            text: "←  VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+
+<EstadisticasScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            padding: [dp(5), 0]
+            Label:
+                text: "📈 ESTADÍSTICAS"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#F59E0B')
+
+        ScrollView:
+            GridLayout:
+                id: stats_container
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(10)
+
+        Button:
+            text: "←  VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+
+<AjustesScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            padding: [dp(5), 0]
+            Label:
+                text: "⚙️ AJUSTES"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#94A3B8')
+
+        ScrollView:
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(12)
+                padding: dp(5)
+
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(180)
+                    spacing: dp(8)
+                    padding: dp(12)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(12)]
+                    Label:
+                        text: "ALERTAS DE STOCK MÍNIMO"
+                        bold: True
+                        color: utils.get_color_from_hex('#F59E0B')
+                        size_hint_y: None
+                        height: dp(30)
+                    Spinner:
+                        id: alerta_material_spinner
+                        text: "SELECCIONAR MATERIAL"
+                        values: []
+                        size_hint_y: None
+                        height: dp(45)
+                    BoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(45)
+                        TextInput:
+                            id: stock_minimo_input
+                            hint_text: "Stock mínimo (ej: 5)"
+                            input_filter: 'float'
+                            multiline: False
+                        Button:
+                            text: "GUARDAR"
+                            size_hint_x: None
+                            width: dp(100)
+                            background_color: utils.get_color_from_hex('#059669')
+                            on_release: root.guardar_alerta()
+                    Label:
+                        id: info_alerta
+                        text: ""
+                        color: utils.get_color_from_hex('#10B981')
+                        size_hint_y: None
+                        height: dp(22)
+
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(230)
+                    spacing: dp(8)
+                    padding: dp(12)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#0C4A6E')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(12)]
+                    Label:
+                        text: "ACTUALIZACIÓN DESDE CORREO"
+                        bold: True
+                        color: utils.get_color_from_hex('#38BDF8')
+                        size_hint_y: None
+                        height: dp(30)
+                        halign: 'left'
+                        text_size: self.size
+                    Label:
+                        text: "Asunto a buscar (vacío = cualquiera):"
+                        font_size: '11sp'
+                        color: utils.get_color_from_hex('#94A3B8')
+                        size_hint_y: None
+                        height: dp(20)
+                        halign: 'left'
+                        text_size: self.size
+                    TextInput:
+                        id: filtro_asunto
+                        hint_text: "ej: INVENTARIO  (vacío = sin filtro)"
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(40)
+                        font_size: '13sp'
+                    Label:
+                        text: "Remitente a buscar (vacío = cualquiera):"
+                        font_size: '11sp'
+                        color: utils.get_color_from_hex('#94A3B8')
+                        size_hint_y: None
+                        height: dp(20)
+                        halign: 'left'
+                        text_size: self.size
+                    TextInput:
+                        id: filtro_remitente
+                        hint_text: "ej: jefe@empresa.com  (vacío = sin filtro)"
+                        multiline: False
+                        size_hint_y: None
+                        height: dp(40)
+                        font_size: '13sp'
+                    Button:
+                        text: "GUARDAR FILTROS"
+                        size_hint_y: None
+                        height: dp(40)
+                        background_color: utils.get_color_from_hex('#0369A1')
+                        on_release: root.guardar_filtros_correo()
+
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(145)
+                    spacing: dp(8)
+                    padding: dp(12)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#1E293B')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(12)]
+                    Label:
+                        text: "EXPORTAR DATOS"
+                        bold: True
+                        color: utils.get_color_from_hex('#38BDF8')
+                        size_hint_y: None
+                        height: dp(30)
+                    Label:
+                        id: lbl_carpeta_export
+                        text: ""
+                        font_size: '11sp'
+                        color: utils.get_color_from_hex('#64748B')
+                        size_hint_y: None
+                        height: dp(28)
+                        halign: 'left'
+                        text_size: self.size
+                        shorten: True
+                        shorten_from: 'left'
+                    BoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(50)
+                        Button:
+                            text: "CSV"
+                            background_color: utils.get_color_from_hex('#0369A1')
+                            on_release: root.exportar_csv()
+                        Button:
+                            text: "EXCEL"
+                            background_color: utils.get_color_from_hex('#065F46')
+                            on_release: root.exportar_excel_local()
+
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(100)
+                    spacing: dp(8)
+                    padding: dp(12)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#450A0A')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(12)]
+                    Label:
+                        text: "ZONA DE PELIGRO"
+                        bold: True
+                        color: utils.get_color_from_hex('#F87171')
+                        size_hint_y: None
+                        height: dp(28)
+                    Button:
+                        text: "PURGAR REGISTROS ANTIGUOS (+90 días)"
+                        size_hint_y: None
+                        height: dp(45)
+                        background_color: utils.get_color_from_hex('#991B1B')
+                        on_release: root.confirmar_purga()
+
+        Label:
+            id: info_ajustes
+            text: ""
+            color: utils.get_color_from_hex('#10B981')
+            size_hint_y: None
+            height: dp(28)
+
+        Button:
+            text: "←  VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+
+<ImportarExcelScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(12)
+        spacing: dp(8)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0F172A')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        Label:
+            text: "IMPORTAR EXCEL AL INVENTARIO"
+            bold: True
+            font_size: '16sp'
+            color: utils.get_color_from_hex('#38BDF8')
+            size_hint_y: None
+            height: dp(36)
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(175)
+            spacing: dp(6)
+            padding: dp(10)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#1E293B')
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(10)]
+
+            Label:
+                text: "① SELECCIONA O PEGA LA RUTA DEL ARCHIVO"
+                bold: True
+                font_size: '12sp'
+                color: utils.get_color_from_hex('#F59E0B')
+                size_hint_y: None
+                height: dp(22)
+                halign: 'left'
+                text_size: self.size
+
+            Label:
+                id: lbl_hint_carpeta
+                text: ""
+                font_size: '10sp'
+                color: utils.get_color_from_hex('#475569')
+                size_hint_y: None
+                height: dp(18)
+                halign: 'left'
+                text_size: self.size
+                shorten: True
+                shorten_from: 'left'
+
+            TextInput:
+                id: ruta_excel
+                hint_text: "La ruta aparece aquí al explorar o pegar"
+                multiline: False
+                size_hint_y: None
+                height: dp(42)
+                font_size: '12sp'
+
+            BoxLayout:
+                size_hint_y: None
+                height: dp(44)
+                spacing: dp(6)
+                Button:
+                    text: "EXPLORAR"
+                    font_size: '13sp'
+                    bold: True
+                    background_color: utils.get_color_from_hex('#7C3AED')
+                    on_release: root.abrir_explorador()
+                Button:
+                    text: "PEGAR"
+                    font_size: '13sp'
+                    background_color: utils.get_color_from_hex('#475569')
+                    on_release: root.pegar_ruta()
+                Button:
+                    text: "PREVISUALIZAR"
+                    font_size: '13sp'
+                    bold: True
+                    background_color: utils.get_color_from_hex('#0369A1')
+                    on_release: root.previsualizar()
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(188)
+            spacing: dp(5)
+            padding: dp(10)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#1E293B')
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(10)]
+
+            Label:
+                text: "② COLUMNAS DEL EXCEL  (se auto-detectan al previsualizar)"
+                bold: True
+                font_size: '12sp'
+                color: utils.get_color_from_hex('#F59E0B')
+                size_hint_y: None
+                height: dp(22)
+                halign: 'left'
+                text_size: self.size
+
+            BoxLayout:
+                size_hint_y: None
+                height: dp(36)
+                spacing: dp(6)
+                Label:
+                    text: "Responsable"
+                    font_size: '11sp'
+                    size_hint_x: 0.28
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                TextInput:
+                    id: col_nombre
+                    text: "Nombre"
+                    multiline: False
+                    font_size: '12sp'
+                Label:
+                    text: "Material"
+                    font_size: '11sp'
+                    size_hint_x: 0.22
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                TextInput:
+                    id: col_material
+                    text: "Material"
+                    multiline: False
+                    font_size: '12sp'
+
+            BoxLayout:
+                size_hint_y: None
+                height: dp(36)
+                spacing: dp(6)
+                Label:
+                    text: "SKU"
+                    font_size: '11sp'
+                    size_hint_x: 0.28
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                TextInput:
+                    id: col_sku
+                    text: "SKU"
+                    multiline: False
+                    font_size: '12sp'
+                Label:
+                    text: "Cantidad"
+                    font_size: '11sp'
+                    size_hint_x: 0.22
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                TextInput:
+                    id: col_cantidad
+                    text: "Cantidad"
+                    multiline: False
+                    font_size: '12sp'
+
+            BoxLayout:
+                size_hint_y: None
+                height: dp(36)
+                spacing: dp(6)
+                Label:
+                    text: "Tipo"
+                    font_size: '11sp'
+                    size_hint_x: 0.28
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                TextInput:
+                    id: col_tipo
+                    text: "Tipo"
+                    multiline: False
+                    font_size: '12sp'
+                Label:
+                    text: "Fecha"
+                    font_size: '11sp'
+                    size_hint_x: 0.22
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                TextInput:
+                    id: col_fecha
+                    text: "Fecha"
+                    multiline: False
+                    font_size: '12sp'
+
+            BoxLayout:
+                size_hint_y: None
+                height: dp(36)
+                spacing: dp(6)
+                Label:
+                    text: "Hoja Excel"
+                    font_size: '11sp'
+                    size_hint_x: 0.28
+                    color: utils.get_color_from_hex('#94A3B8')
+                    halign: 'right'
+                    text_size: self.size
+                    valign: 'middle'
+                Spinner:
+                    id: hoja_spinner
+                    text: "— detectar —"
+                    values: ["— detectar —"]
+                    font_size: '12sp'
+
+        Label:
+            id: estado_importar
+            text: "Pulsa EXPLORAR para buscar tu archivo Excel"
+            color: utils.get_color_from_hex('#94A3B8')
+            markup: True
+            size_hint_y: None
+            height: dp(36)
+            halign: 'left'
+            text_size: self.size
+            font_size: '12sp'
+
+        ScrollView:
+            size_hint_y: 1
+            do_scroll_x: False
+            GridLayout:
+                id: preview_container
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(5)
+
+        Button:
+            id: btn_importar
+            text: "IMPORTAR AL INVENTARIO"
+            bold: True
+            font_size: '15sp'
+            size_hint_y: None
+            height: dp(52)
+            background_color: utils.get_color_from_hex('#059669')
+            disabled: True
+            on_release: root.importar()
+
+        Button:
+            text: "← VOLVER"
+            size_hint_y: None
+            height: dp(46)
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'
+'''
+
+# ─────────────────────────────────────────────
+#  PANTALLAS
+# ─────────────────────────────────────────────
+
+class InventarioScreen(Screen):
+    def on_enter(self):
+        self.actualizar_spinners()
+        self._verificar_alertas_silencioso()
+        self._actualizar_dashboard()
+        self._cargar_actividad_reciente()
+        try:
+            self.ids.info_carpeta.text = f"Exportaciones: {EXPORT_DIR}"
+        except Exception:
+            pass
+        gc.collect()
+
+    def actualizar_spinners(self):
+        try:
+            nombres    = sorted({str(r[0]).upper() for r in db_query("SELECT DISTINCT nombre FROM movimientos") if r[0]})
+            materiales = sorted({str(r[0]).upper() for r in db_query("SELECT DISTINCT material FROM movimientos") if r[0]})
+            self.ids.responsable_spinner.values = nombres
+            self.ids.producto_spinner.values    = materiales
+        except Exception:
+            pass
+
+    def _verificar_alertas_silencioso(self):
+        try:
+            alertas = obtener_alertas_activas()
+            if alertas:
+                n = len(alertas)
+                self.ids.info.text = f"[color=#F59E0B]{n} alerta{'s' if n > 1 else ''} de stock[/color]"
+                self.ids.btn_alertas.text = f"ALERTAS ({n})"
+                self.ids.btn_alertas.background_color = get_color_from_hex('#DC2626')
+            else:
+                self.ids.btn_alertas.text = "ALERTAS"
+                self.ids.btn_alertas.background_color = get_color_from_hex('#1E293B')
+        except Exception:
+            pass
+
+    def _actualizar_dashboard(self):
+        """Actualiza las tarjetas de resumen del dashboard."""
+        try:
+            hora = datetime.now().hour
+            if hora < 7:
+                saludo = "🌙 Buenas noches"
+            elif hora < 12:
+                saludo = "☀️ Buenos dias"
+            elif hora < 18:
+                saludo = "🌤️ Buenas tardes"
+            else:
+                saludo = "🌙 Buenas noches"
+            self.ids.lbl_saludo.text = saludo
+
+            meses = ['enero','febrero','marzo','abril','mayo','junio',
+                     'julio','agosto','septiembre','octubre','noviembre','diciembre']
+            ahora = datetime.now()
+            self.ids.lbl_fecha_hoy.text = f"{ahora.day} de {meses[ahora.month-1]} {ahora.year}  •  {ahora.strftime('%H:%M')}"
+
+            total_mat = db_query("SELECT COUNT(DISTINCT material) FROM movimientos", fetchall=False)[0] or 0
+            self.ids.stat_materiales.text = str(total_mat)
+
+            hoy = ahora.strftime("%d/%m/%Y")
+            movs_hoy = db_query(f"SELECT COUNT(*) FROM movimientos WHERE fecha LIKE '{hoy}%'", fetchall=False)[0] or 0
+            self.ids.stat_movs_hoy.text = str(movs_hoy)
+
+            # FIX: stat_alertas muestra alertas de stock (no pendientes de retorno).
+            # stat_pendientes muestra materiales que están fuera sin retornar.
+            alertas = obtener_alertas_activas()
+            self.ids.stat_alertas.text = str(len(alertas))
+
+            # FIX: Calcular correctamente los materiales pendientes de retorno
+            # usando la lógica de saldo (salidas - entradas de no-inventario).
+            prestamos_activos = obtener_equipos_en_prestamo()
+            self.ids.stat_pendientes.text = str(len(prestamos_activos))
+
+            try:
+                size_kb = os.path.getsize(DB_PATH) / 1024
+                self.ids.lbl_resumen_db.text = f"BD: {size_kb:.0f} KB"
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _cargar_actividad_reciente(self):
+        """Muestra los últimos 5 movimientos como feed de actividad."""
+        try:
+            self.ids.actividad_reciente.clear_widgets()
+            movs = db_query(
+                "SELECT nombre, material, cantidad, tipo, fecha FROM movimientos ORDER BY id DESC LIMIT 5"
+            )
+            if not movs:
+                self.ids.actividad_reciente.add_widget(
+                    Label(text="Sin movimientos registrados",
+                          color=get_color_from_hex('#475569'),
+                          size_hint_y=None, height=dp(30), font_size='12sp')
+                )
+                return
+            for nombre, material, cantidad, tipo, fecha in movs:
+                if tipo == "ENTRADA":
+                    icono = "▲"
+                    color_hex = '#4ADE80'
+                else:
+                    icono = "▼"
+                    color_hex = '#F87171'
+                fecha_corta = str(fecha)[:16] if fecha else ""
+                texto = (
+                    f"[color={color_hex}]{icono}[/color] "
+                    f"[b]{material}[/b]  x{cantidad}  "
+                    f"[color=#64748B]{nombre} • {fecha_corta}[/color]"
+                )
+                lbl = Label(
+                    text=texto,
+                    markup=True,
+                    font_size='11sp',
+                    color=get_color_from_hex('#CBD5E1'),
+                    size_hint_y=None,
+                    height=dp(28),
+                    halign='left',
+                    text_size=(Window.width * 0.85, None),
+                )
+                self.ids.actividad_reciente.add_widget(lbl)
+        except Exception:
+            pass
+
+    def mostrar_alertas(self):
+        rows = db_query(
+            "SELECT nombre,material,sku,cantidad,tipo,fecha,notas FROM movimientos "
+            "WHERE UPPER(nombre) != 'INVENTARIO' ORDER BY id ASC"
+        )
+        actualmente_fuera = {}
+        for n, m, s, c, t, f, notas in rows:
+            key = f"{n}|{m}"
+            if t == "SALIDA":
+                if key not in actualmente_fuera:
+                    actualmente_fuera[key] = [n, m, s, float(c), t, f, notas or ""]
+                else:
+                    actualmente_fuera[key][3] += float(c)
+            elif t == "ENTRADA" and key in actualmente_fuera:
+                actualmente_fuera[key][3] -= float(c)
+                if actualmente_fuera[key][3] <= 0:
+                    del actualmente_fuera[key]
+
+        pendientes = list(actualmente_fuera.values())
+        content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(8))
+        pop = Popup(title=f"⚠ MATERIALES SIN RETORNAR ({len(pendientes)})",
+                    content=content, size_hint=(0.93, 0.82))
+        if not pendientes:
+            content.add_widget(Label(text="✓ Todo en orden — ningún material pendiente de retorno.",
+                                     color=get_color_from_hex('#10B981'), halign='center'))
+        else:
+            sv = ScrollView()
+            gl = GridLayout(cols=1, size_hint_y=None, spacing=dp(8))
+            gl.bind(minimum_height=gl.setter('height'))
+            for item in sorted(pendientes, key=lambda x: x[0]):
+                n, m, s, c, _, f, notas = item
+                tiene_notas = bool(notas and notas.strip())
+                altura = dp(110) if tiene_notas else dp(80)
+                card = crear_tarjeta(altura, '#3B1A00')
+                card.add_widget(Label(
+                    text=f"[b]{m}[/b]  —  Responsable: [color=#F59E0B]{n}[/color]",
+                    markup=True, color=get_color_from_hex('#F87171'),
+                    size_hint_y=None, height=dp(24),
+                    halign='left', text_size=(Window.width * 0.82, None)
+                ))
+                card.add_widget(Label(
+                    text=f"Cantidad fuera: [b]{round(c,2)}[/b]  |  SKU: {s or 'N/A'}  |  Salida: {f}",
+                    color=get_color_from_hex('#FCA5A5'), font_size='12sp',
+                    size_hint_y=None, height=dp(20),
+                    halign='left', text_size=(Window.width * 0.82, None)
+                ))
+                if tiene_notas:
+                    card.add_widget(Label(
+                        text=f"[color=#94A3B8]Notas:[/color] [color=#E2E8F0]{notas}[/color]",
+                        markup=True, font_size='11sp',
+                        size_hint_y=None, height=dp(22),
+                        halign='left', text_size=(Window.width * 0.82, None)
+                    ))
+                gl.add_widget(card)
+            sv.add_widget(gl)
+            content.add_widget(sv)
+        content.add_widget(Button(text="CERRAR", size_hint_y=None, height=dp(45),
+                                   background_color=get_color_from_hex('#334155'),
+                                   on_release=pop.dismiss))
+        pop.open()
+
+    def chequear_actualizacion(self):
+        self.ids.info.text = "Buscando actualizacion..."
+        if not REQUESTS_AVAILABLE:
+            self.ids.info.text = "requests no instalado"
+            return
+        threading.Thread(target=self._hilo_descarga, daemon=True).start()
+
+    def _hilo_descarga(self):
+        try:
+            r = requests.get(URL_NUEVA_APK, stream=True, timeout=15)
+            if r.status_code == 200:
+                ruta = "update_inventario.apk" if platform == 'android' else "update_inventario.exe"
+                with open(ruta, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if chunk: f.write(chunk)
+                Clock.schedule_once(lambda dt: self._instalar_apk(ruta))
+            else:
+                Clock.schedule_once(lambda dt: setattr(self.ids.info, 'text', "Archivo no encontrado"))
+        except Exception:
+            Clock.schedule_once(lambda dt: setattr(self.ids.info, 'text', "Error de red"))
+
+    def _instalar_apk(self, ruta):
+        self.ids.info.text = "Instalando..."
+        if platform == 'android':
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                Intent = autoclass('android.content.Intent')
+                Uri    = autoclass('android.net.Uri')
+                File   = autoclass('java.io.File')
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setDataAndType(Uri.fromFile(File(ruta)), "application/vnd.android.package-archive")
+                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                PythonActivity.mActivity.startActivity(intent)
+            except Exception:
+                self.ids.info.text = "Error en instalador"
+        else:
+            self.ids.info.text = f"Guardado: {ruta}"
+
+    def actualizar_desde_correo(self):
+        """Abre el popup de progreso y lanza el actualizador."""
+        self._popup_correo = self._crear_popup_progreso()
+        self._popup_correo.open()
+
+        actualizador = ActualizadorCorreo(
+            callback_progreso=self._actualizar_progreso_correo,
+            callback_fin=self._finalizar_actualizacion_correo,
+        )
+        actualizador.ejecutar()
+
+    def _crear_popup_progreso(self):
+        content = BoxLayout(orientation='vertical', padding=dp(15), spacing=dp(12))
+        pop = Popup(
+            title="Actualizando desde correo...",
+            content=content,
+            size_hint=(0.92, 0.55),
+            auto_dismiss=False,
+        )
+        self._lbl_progreso = Label(
+            text="Iniciando...",
+            color=get_color_from_hex('#38BDF8'),
+            halign='center',
+            font_size='14sp',
+            text_size=(Window.width * 0.85, None),
+        )
+        content.add_widget(self._lbl_progreso)
+        btn_cerrar = Button(
+            text="⏳ Procesando... (toca para cerrar si ya terminó)",
+            size_hint_y=None, height=dp(46),
+            background_color=get_color_from_hex('#334155'),
+        )
+        btn_cerrar.bind(on_release=pop.dismiss)
+        content.add_widget(btn_cerrar)
+        self._btn_cerrar_popup = btn_cerrar
+        return pop
+
+    def _actualizar_progreso_correo(self, texto):
+        try:
+            self._lbl_progreso.text = texto
+        except Exception:
+            pass
+
+    def _finalizar_actualizacion_correo(self, exito, datos):
+        try:
+            self._popup_correo.dismiss()
+        except Exception:
+            pass
+
+        if exito:
+            self._mostrar_resultado_correo(datos)
+            self.actualizar_spinners()
+        else:
+            self._mostrar_error_correo(datos.get("error", "Error desconocido"))
+
+    def _mostrar_resultado_correo(self, datos):
+        """Popup de éxito con resumen de la importación."""
+        content = BoxLayout(orientation='vertical', padding=dp(15), spacing=dp(10))
+        pop = Popup(
+            title="Inventario actualizado",
+            content=content,
+            size_hint=(0.92, 0.72),
+        )
+        card_ok = crear_tarjeta(dp(60), '#064E3B')
+        card_ok.add_widget(Label(
+            text="[b][color=#10B981]ACTUALIZACION COMPLETADA[/color][/b]",
+            markup=True, font_size='15sp',
+        ))
+        content.add_widget(card_ok)
+
+        if datos.get("de") or datos.get("asunto"):
+            card_origen = crear_tarjeta(dp(80), '#1E293B')
+            card_origen.add_widget(Label(
+                text=f"De: {datos.get('de', 'N/A')[:50]}",
+                color=get_color_from_hex('#94A3B8'), font_size='12sp',
+            ))
+            card_origen.add_widget(Label(
+                text=f"Asunto: {datos.get('asunto', 'N/A')[:50]}",
+                color=get_color_from_hex('#94A3B8'), font_size='12sp',
+            ))
+            content.add_widget(card_origen)
+
+        card_stats = crear_tarjeta(dp(110), '#1E3A5F')
+        card_stats.add_widget(Label(
+            text="RESULTADOS DE LA IMPORTACIÓN",
+            color=get_color_from_hex('#38BDF8'), font_size='12sp',
+            bold=True,
+        ))
+        card_stats.add_widget(Label(
+            text=f"[b][color=#10B981]Insertados: {datos.get('insertados', 0)}[/color][/b]",
+            markup=True, font_size='16sp',
+        ))
+        card_stats.add_widget(Label(
+            text=(f"Omitidos: {datos.get('omitidos', 0)}   "
+                  f"Errores: {datos.get('errores', 0)}"),
+            color=get_color_from_hex('#94A3B8'), font_size='13sp',
+        ))
+        content.add_widget(card_stats)
+
+        card_archivo = crear_tarjeta(dp(65), '#1E293B')
+        card_archivo.add_widget(Label(
+            text=f"Archivo: {datos.get('archivo', 'N/A')[:45]}",
+            color=get_color_from_hex('#CBD5E1'), font_size='12sp',
+        ))
+        card_archivo.add_widget(Label(
+            text=f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
+            color=get_color_from_hex('#475569'), font_size='11sp',
+        ))
+        content.add_widget(card_archivo)
+
+        content.add_widget(Button(
+            text="ENTENDIDO",
+            size_hint_y=None, height=dp(48),
+            background_color=get_color_from_hex('#059669'),
+            on_release=pop.dismiss,
+        ))
+        self.ids.info.text = (
+            f"[color=#10B981]Actualizado desde correo: "
+            f"+{datos.get('insertados', 0)} registros[/color]"
+        )
+        pop.open()
+
+    def _mostrar_error_correo(self, mensaje_error):
+        """Popup de error con mensaje descriptivo."""
+        content = BoxLayout(orientation='vertical', padding=dp(15), spacing=dp(10))
+        pop = Popup(
+            title="Error al actualizar desde correo",
+            content=content,
+            size_hint=(0.92, 0.65),
+        )
+        sv = ScrollView()
+        lbl = Label(
+            text=mensaje_error,
+            color=get_color_from_hex('#F87171'),
+            halign='center',
+            font_size='13sp',
+            size_hint_y=None,
+            text_size=(Window.width * 0.82, None),
+        )
+        lbl.bind(texture_size=lbl.setter('size'))
+        sv.add_widget(lbl)
+        content.add_widget(sv)
+
+        card_tip = crear_tarjeta(dp(130), '#1E293B')
+        card_tip.add_widget(Label(
+            text=" POSIBLES SOLUCIONES",
+            color=get_color_from_hex('#F59E0B'), bold=True, font_size='13sp',
+        ))
+        card_tip.add_widget(Label(
+            text="• Activa IMAP en Gmail → Configuración → Ver toda la config → Reenvío e IMAP",
+            color=get_color_from_hex('#94A3B8'), font_size='11sp', halign='center',
+            text_size=(Window.width * 0.75, None),
+        ))
+        card_tip.add_widget(Label(
+            text="• Usa una contraseña de aplicación (no la contraseña normal)",
+            color=get_color_from_hex('#94A3B8'), font_size='11sp', halign='center',
+            text_size=(Window.width * 0.75, None),
+        ))
+        card_tip.add_widget(Label(
+            text="• Verifica que el Excel adjunto esté en la bandeja de entrada",
+            color=get_color_from_hex('#94A3B8'), font_size='11sp', halign='center',
+            text_size=(Window.width * 0.75, None),
+        ))
+        content.add_widget(card_tip)
+
+        content.add_widget(Button(
+            text="CERRAR",
+            size_hint_y=None, height=dp(46),
+            background_color=get_color_from_hex('#334155'),
+            on_release=pop.dismiss,
+        ))
+        self.ids.info.text = "[color=#F87171]Error al actualizar desde correo[/color]"
+        pop.open()
+
+    def obtener_stock_logica(self, material):
+        return obtener_stock_material(material)
+
+    def procesar(self, tipo, r=None, p=None, c=None, s="N/A"):
+        resp = (r
+                or self.ids.nombre_nuevo.text.strip().upper()
+                or (self.ids.responsable_spinner.text
+                    if self.ids.responsable_spinner.text != "SELECCIONAR RESPONSABLE" else ""))
+        prod = (p
+                or self.ids.producto_nuevo.text.strip().upper()
+                or (self.ids.producto_spinner.text
+                    if self.ids.producto_spinner.text != "SELECCIONAR MATERIAL" else ""))
+        cant_str = str(c) if c else self.ids.cantidad.text.strip()
+
+        if not all([resp, prod, cant_str]):
+            self.ids.info.text = "[color=#F87171]Responsable, material y cantidad son obligatorios[/color]"
+            return
+        try:
+            val = float(cant_str)
+            if val <= 0:
+                self.ids.info.text = "[color=#F87171]La cantidad debe ser mayor a 0[/color]"
+                return
+            _, actual = obtener_stock_material(prod)
+            if tipo == "SALIDA" and resp.upper() != "INVENTARIO":
+                if actual <= 0:
+                    self.ids.info.text = f"[color=#EF4444]SIN STOCK DISPONIBLE: {prod}[/color]"
+                    return
+                if val > actual:
+                    self.ids.info.text = f"[color=#EF4444]SOLO HAY {actual} UNIDADES DISPONIBLES[/color]"
+                    return
+            f_str     = self.ids.f_m.text.strip() or datetime.now().strftime("%d/%m/%Y %H:%M")
+            dias      = self.ids.d_p.text.strip() or 0
+            notas     = self.ids.notas.text.strip()
+            ubicacion = self.ids.ubicacion.text.strip().upper()
+            sku_val   = s if s != "N/A" else self.ids.sku.text.strip()
+            fijo, actual2 = obtener_stock_material(prod)
+            nuevo_st = round(actual2 + (val if tipo == "ENTRADA" else -val), 4)
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                '''INSERT INTO movimientos
+                   (nombre,material,sku,cantidad,tipo,fecha,stock_registro,dias,retorno,notas,ubicacion)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                (resp, prod, sku_val, val, tipo, f_str, nuevo_st, dias, "N/A", notas, ubicacion)
+            )
+            if resp.upper() == "INVENTARIO" and self.ids.c_l.active:
+                cursor.execute(
+                    "INSERT INTO limpieza (material,cantidad,estado,fecha,notas) VALUES (?,?,?,?,?)",
+                    (prod, val, "SUCIO", f_str, notas)
+                )
+            conn.commit()
+            conn.close()
+            log_auditoria(f"MOV_{tipo}", f"{resp} | {prod} | x{val} | {f_str}")
+            icono = "▲" if tipo == "ENTRADA" else "▼"
+            self.ids.info.text = f"[color=#10B981]✓ {icono} {tipo} REGISTRADA — {prod} x{val}[/color]"
+            self.actualizar_spinners()
+            self.limpiar_campos()
+            self._actualizar_dashboard()
+            self._cargar_actividad_reciente()
+        except ValueError:
+            self.ids.info.text = "[color=#F87171]✗ CANTIDAD INVÁLIDA[/color]"
+        except sqlite3.Error as e:
+            self.ids.info.text = f"[color=#F87171]✗ ERROR BD: {e}[/color]"
+
+    def limpiar_campos(self):
+        for field in ['nombre_nuevo','producto_nuevo','sku','cantidad','d_p','f_m','notas','ubicacion']:
+            self.ids[field].text = ""
+        self.ids.responsable_spinner.text = "SELECCIONAR RESPONSABLE"
+        self.ids.producto_spinner.text    = "SELECCIONAR MATERIAL"
+        self.ids.c_l.active = False
+        gc.collect()
+
+    def enviar_correo(self):
+        self.ids.info.text = "⏳ Preparando Excel..."
+        threading.Thread(target=self._enviar_correo_worker, daemon=True).start()
+
+    def _enviar_correo_worker(self):
+        EXCEL_TEMP = ruta_exportacion(f"Reporte_Inventario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        try:
+            generar_excel(EXCEL_TEMP)
+            msg = MIMEMultipart()
+            cfg = EMAIL_CONFIG
+            msg['From']    = cfg["remitente"]
+            msg['To']      = ", ".join(cfg["destinatarios"])
+            msg['Subject'] = f"INVENTARIO PRO — {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            stats = obtener_reporte_estadisticas()
+            body  = (f"Reporte automático generado el {datetime.now().strftime('%d/%m/%Y a las %H:%M')}.\n\n"
+                     f"Resumen:\n"
+                     f"  • Total movimientos: {stats['total_movimientos']}\n"
+                     f"  • Entradas: {stats['entradas']} | Salidas: {stats['salidas']}\n"
+                     f"  • Materiales distintos: {stats['materiales']}\n"
+                     f"  • Material más activo: {stats['material_top']}\n\n"
+                     f"Ver detalle en el archivo adjunto.\n\n— INVENTARIO PRO v{VERSION_ACTUAL}")
+            msg.attach(MIMEText(body, 'plain', 'utf-8'))
+            with open(EXCEL_TEMP, "rb") as f:
+                parte = MIMEBase('application', 'octet-stream')
+                parte.set_payload(f.read())
+                encoders.encode_base64(parte)
+                parte.add_header('Content-Disposition', f'attachment; filename={os.path.basename(EXCEL_TEMP)}')
+                msg.attach(parte)
+            s = smtplib.SMTP('smtp.gmail.com', 587)
+            s.starttls()
+            s.login(cfg["remitente"], cfg["password"])
+            for dest in cfg["destinatarios"]:
+                s.sendmail(cfg["remitente"], dest, msg.as_string())
+            s.quit()
+            log_auditoria("EMAIL_ENVIADO", f"Destinatarios: {cfg['destinatarios']}")
+            Clock.schedule_once(lambda dt: setattr(self.ids.info, 'text',
+                                                   "[color=#10B981] ENVIADO EXITOSAMENTE[/color]"))
+        except Exception as e:
+            Clock.schedule_once(lambda dt: setattr(self.ids.info, 'text',
+                                                   f"[color=#F87171]ERROR: {e}[/color]"))
+
+    def hacer_backup(self):
+        self.ids.info.text = " Generando backup..."
+        threading.Thread(target=self._backup_worker, daemon=True).start()
+
+    def _backup_worker(self):
+        try:
+            nombre = ruta_exportacion(f"backup_inventario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            generar_excel(nombre)
+            log_auditoria("BACKUP", nombre)
+            Clock.schedule_once(lambda dt: setattr(self.ids.info, 'text',
+                                                   f"[color=#10B981]Backup guardado en:\n{nombre}[/color]"))
+        except Exception as e:
+            Clock.schedule_once(lambda dt: setattr(self.ids.info, 'text',
+                                                   f"[color=#F87171]Error backup: {e}[/color]"))
+
+
+class LimpiezaScreen(Screen):
+    def on_enter(self):
+        self.actualizar_spinner_limpieza()
+        self.consultar_historial()
+        gc.collect()
+
+    def actualizar_spinner_limpieza(self):
+        mats = sorted({str(r[0]).upper() for r in db_query("SELECT DISTINCT material FROM limpieza") if r[0]})
+        self.ids.limpieza_spinner.values = mats
+
+    def registrar_limpieza(self, estado):
+        mat   = (self.ids.m_n.text.strip().upper()
+                 or (self.ids.limpieza_spinner.text
+                     if self.ids.limpieza_spinner.text != "SELECCIONAR MATERIAL" else ""))
+        cant  = self.ids.m_c.text.strip()
+        notas = self.ids.m_notas.text.strip()
+        if not mat or not cant:
+            self.ids.info_limpieza.text = "Material y cantidad requeridos"
+            return
+        existe = db_query("SELECT 1 FROM movimientos WHERE UPPER(material)=? LIMIT 1", (mat,), fetchall=False)
+        if not existe:
+            self.ids.info_limpieza.text = f"'{mat}' no existe en movimientos"
+            return
+        try:
+            db_execute(
+                "INSERT INTO limpieza (material,cantidad,estado,fecha,notas) VALUES (?,?,?,?,?)",
+                (mat, float(cant), estado, datetime.now().strftime("%d/%m/%Y %H:%M"), notas)
+            )
+            self.ids.m_n.text = ""; self.ids.m_c.text = ""; self.ids.m_notas.text = ""
+            self.ids.info_limpieza.text = ""
+            self.ids.limpieza_spinner.text = "SELECCIONAR MATERIAL"
+            self.consultar_historial()
+            self.actualizar_spinner_limpieza()
+        except Exception as e:
+            self.ids.info_limpieza.text = f"Error: {e}"
+
+    def consultar_historial(self):
+        self.ids.hist_limpieza.clear_widgets()
+        busq  = self.ids.f_l.text.lower()
+        rows  = db_query("SELECT material, cantidad, estado FROM limpieza")
+        totales = defaultdict(lambda: {"LIMPIO": 0.0, "SUCIO": 0.0})
+        for m, c, e in rows:
+            totales[str(m).upper()][e] += float(c)
+        for mat, v in sorted(totales.items()):
+            if busq and busq not in mat.lower():
+                continue
+            neto = v["SUCIO"] - v["LIMPIO"]
+            if neto <= 0:
+                continue
+            card = crear_tarjeta(dp(90))
+            card.add_widget(Label(text=f"[b]{mat}[/b]", markup=True,
+                                  color=get_color_from_hex('#38BDF8')))
+            card.add_widget(Label(text=f"Sucio: {v['SUCIO']}  |  Limpio: {v['LIMPIO']}"))
+            card.add_widget(Label(
+                text=f"[color=#F59E0B]Pendiente de limpiar: {max(0, neto):.2f}[/color]",
+                markup=True
+            ))
+            self.ids.hist_limpieza.add_widget(card)
+
+
+class PendientesScreen(Screen):
+    def on_enter(self):
+        self.cargar_pendientes()
+        gc.collect()
+
+    def cargar_pendientes(self):
+        self.ids.lista_pendientes.clear_widgets()
+        filtro = self.ids.filtro_pendientes.text.upper()
+        rows = db_query(
+            "SELECT nombre,material,sku,cantidad,tipo,fecha,notas FROM movimientos "
+            "WHERE UPPER(nombre) != 'INVENTARIO' ORDER BY id ASC"
+        )
+        actualmente_fuera = {}
+        for n, m, s, c, t, f, notas in rows:
+            key = f"{n}|{m}"
+            if t == "SALIDA":
+                if key not in actualmente_fuera:
+                    actualmente_fuera[key] = [n, m, s, float(c), t, f, notas or ""]
+                else:
+                    actualmente_fuera[key][3] += float(c)
+                    nota_existente = actualmente_fuera[key][6]
+                    nota_nueva = notas or ""
+                    if nota_nueva and nota_nueva not in nota_existente:
+                        actualmente_fuera[key][6] = (
+                            (nota_existente + " | " + nota_nueva).strip(" | ")
+                            if nota_existente else nota_nueva
+                        )
+            elif t == "ENTRADA" and key in actualmente_fuera:
+                actualmente_fuera[key][3] -= float(c)
+                if actualmente_fuera[key][3] <= 0:
+                    del actualmente_fuera[key]
+
+        grupos = defaultdict(list)
+        for item in actualmente_fuera.values():
+            if filtro and filtro not in item[0].upper() and filtro not in item[1].upper():
+                continue
+            grupos[item[0]].append(item)
+
+        if not grupos:
+            card = crear_tarjeta(dp(70), '#1E293B')
+            card.add_widget(Label(text="✓ No hay materiales fuera",
+                                  color=get_color_from_hex('#10B981')))
+            self.ids.lista_pendientes.add_widget(card)
+            return
+
+        for responsable, materiales in sorted(grupos.items()):
+            extra_por_item = [dp(75) if (it[6] and it[6].strip()) else dp(58) for it in materiales]
+            card_h = dp(50) + sum(extra_por_item)
+            card   = crear_tarjeta(card_h, '#1A2035')
+            card.add_widget(Label(
+                text=f"[b]{responsable}[/b]  ({len(materiales)} material{'es' if len(materiales)>1 else ''})",
+                markup=True, color=get_color_from_hex('#F87171'),
+                size_hint_y=None, height=dp(30),
+                halign='left', text_size=(Window.width * 0.88, None)
+            ))
+            for it in materiales:
+                n, m, s, c, _, f, notas = it
+                tiene_notas = bool(notas and notas.strip())
+                item_box = BoxLayout(
+                    orientation='vertical',
+                    size_hint_y=None,
+                    height=dp(72) if tiene_notas else dp(55),
+                    spacing=dp(2)
+                )
+                with item_box.canvas.before:
+                    Color(rgba=get_color_from_hex('#334155'))
+                    item_box._rect = RoundedRectangle(
+                        pos=item_box.pos, size=item_box.size, radius=[dp(8)]
+                    )
+
+                # FIX: Los bind de pos/size usaban lambdas que capturaban 'i' como
+                # nombre de argumento, pero Kivy los llama con (instance, value).
+                # Se corrige usando los nombres correctos (inst, val) y forzando
+                # la captura del objeto _rect correcto con una closure explícita.
+                def _make_rect_updater(rect):
+                    def _upd_pos(inst, val):
+                        rect.pos = val
+                    def _upd_size(inst, val):
+                        rect.size = val
+                    return _upd_pos, _upd_size
+
+                _upd_pos, _upd_size = _make_rect_updater(item_box._rect)
+                item_box.bind(pos=_upd_pos, size=_upd_size)
+
+                btn_text = (
+                    f"[b]{m}[/b]   ×{round(c,2)}\n"
+                    f"[size=12sp][color=#94A3B8]SKU: {s or 'N/A'}  |  Salida: {f}[/color][/size]"
+                )
+                btn = Button(
+                    text=btn_text, markup=True, size_hint_y=None, height=dp(52),
+                    background_color=(0, 0, 0, 0),
+                    halign='left', padding_x=dp(10)
+                )
+                btn.bind(on_release=lambda x, i=it: self.confirmar(i))
+                item_box.add_widget(btn)
+
+                if tiene_notas:
+                    notas_box = BoxLayout(
+                        orientation='horizontal',
+                        size_hint_y=None, height=dp(22),
+                        padding=[dp(10), 0]
+                    )
+                    with notas_box.canvas.before:
+                        Color(rgba=get_color_from_hex('#1E3A5F'))
+                        notas_box._rect2 = RoundedRectangle(
+                            pos=notas_box.pos, size=notas_box.size,
+                            radius=[dp(0), dp(0), dp(8), dp(8)]
+                        )
+
+                    # FIX: Mismo problema de closure para notas_box._rect2
+                    def _make_rect2_updater(rect2):
+                        def _upd_pos2(inst, val):
+                            rect2.pos = val
+                        def _upd_size2(inst, val):
+                            rect2.size = val
+                        return _upd_pos2, _upd_size2
+
+                    _upd_pos2, _upd_size2 = _make_rect2_updater(notas_box._rect2)
+                    notas_box.bind(pos=_upd_pos2, size=_upd_size2)
+
+                    notas_box.add_widget(Label(
+                        text=f"[color=#64748B]NOTAS:[/color] [color=#CBD5E1]{notas}[/color]",
+                        markup=True, font_size='11sp',
+                        halign='left', valign='middle',
+                        text_size=(Window.width * 0.82, None)
+                    ))
+                    item_box.add_widget(notas_box)
+                card.add_widget(item_box)
+            self.ids.lista_pendientes.add_widget(card)
+
+    def confirmar(self, item):
+        n, m, s, c, _, f, notas = item
+        tiene_notas = bool(notas and notas.strip())
+        altura_popup = 0.58 if tiene_notas else 0.45
+        content = BoxLayout(orientation='vertical', padding=dp(12), spacing=dp(10))
+        pop = Popup(title="Registrar Retorno", content=content, size_hint=(0.90, altura_popup))
+
+        content.add_widget(Label(
+            text=f"¿Confirmar reingreso de\n[b]{m}[/b]  ×{round(c,2)}\npor [color=#F59E0B]{n}[/color]?",
+            markup=True, halign='center', size_hint_y=None, height=dp(68)
+        ))
+        content.add_widget(Label(
+            text=f"[color=#64748B]SKU:[/color] {s or 'N/A'}  |  [color=#64748B]Salida:[/color] {f}",
+            markup=True, font_size='12sp', halign='center', size_hint_y=None, height=dp(22)
+        ))
+
+        if tiene_notas:
+            notas_card = BoxLayout(
+                orientation='vertical', size_hint_y=None, height=dp(52),
+                padding=[dp(10), dp(6)]
+            )
+            with notas_card.canvas.before:
+                Color(rgba=get_color_from_hex('#1E3A5F'))
+                notas_card._r = RoundedRectangle(pos=notas_card.pos, size=notas_card.size, radius=[dp(8)])
+            notas_card.bind(
+                pos=lambda inst, val: setattr(notas_card._r, 'pos', val),
+                size=lambda inst, val: setattr(notas_card._r, 'size', val)
+            )
+            notas_card.add_widget(Label(
+                text="NOTAS / OBSERVACIONES",
+                font_size='10sp', bold=True, color=get_color_from_hex('#38BDF8'),
+                size_hint_y=None, height=dp(16), halign='left',
+                text_size=(Window.width * 0.78, None)
+            ))
+            notas_card.add_widget(Label(
+                text=notas,
+                font_size='12sp', color=get_color_from_hex('#E2E8F0'),
+                size_hint_y=None, height=dp(24), halign='left',
+                text_size=(Window.width * 0.78, None)
+            ))
+            content.add_widget(notas_card)
+
+        btn = Button(text="✓  SÍ, REGISTRAR RETORNO",
+                     background_color=get_color_from_hex('#059669'),
+                     bold=True,
+                     size_hint_y=None, height=dp(48))
+        btn.bind(on_release=lambda x: self.reingresar(item, pop))
+        content.add_widget(btn)
+        content.add_widget(Button(text="Cancelar", size_hint_y=None, height=dp(40),
+                                   background_color=get_color_from_hex('#334155'),
+                                   on_release=pop.dismiss))
+        pop.open()
+
+    def reingresar(self, it, pop):
+        n, m, s, c, _, _, _ = it
+        App.get_running_app().root.get_screen('inventario').procesar("ENTRADA", r=n, p=m, c=c, s=s)
+        pop.dismiss()
+        self.cargar_pendientes()
+
+
+class FiltroScreen(Screen):
+    def on_enter(self):
+        self.filtrar()
+
+    def filtrar(self):
+        self.ids.c_r.clear_widgets()
+        bn   = self.ids.f_n.text.upper()
+        bp   = self.ids.f_p.text.upper()
+        tipo = self.ids.filtro_tipo.text
+        if len(bn) < 2 and len(bp) < 2:
+            self.ids.filtro_count.text = "Escribe al menos 2 caracteres para buscar"
+            return
+        sql    = "SELECT material,tipo,cantidad,nombre,fecha,sku FROM movimientos WHERE UPPER(nombre) LIKE ? AND UPPER(material) LIKE ?"
+        params = [f'%{bn}%', f'%{bp}%']
+        if tipo in ("ENTRADA", "SALIDA"):
+            sql += " AND tipo=?"
+            params.append(tipo)
+        sql += " ORDER BY id DESC LIMIT 200"
+        rows = db_query(sql, params)
+        self.ids.filtro_count.text = f"{len(rows)} resultado(s)"
+        for m, t, c, n, f, s in rows:
+            color_tipo = '#10B981' if t == "ENTRADA" else '#F87171'
+            card = crear_tarjeta(dp(85))
+            card.add_widget(Label(text=f"[b]{m}[/b]  [color={color_tipo}]{t}[/color]",
+                                  markup=True, color=get_color_from_hex('#38BDF8')))
+            card.add_widget(Label(text=f"Cant: {c} | SKU: {s or 'N/A'}"))
+            card.add_widget(Label(text=f"{n}  •  {f}",
+                                  font_size='12sp', color=get_color_from_hex('#94A3B8')))
+            self.ids.c_r.add_widget(card)
+
+
+class StockScreen(Screen):
+    _filtro_estado = ""
+
+    def on_enter(self):
+        self.actualizar_spinner_stock()
+        self.consultar()
+        gc.collect()
+
+    def actualizar_spinner_stock(self):
+        mats = sorted({str(r[0]).upper() for r in db_query("SELECT DISTINCT material FROM movimientos") if r[0]})
+        self.ids.stock_spinner.values = mats
+
+    def set_filtro_estado(self, estado):
+        self._filtro_estado = estado
+        self.consultar()
+
+    def consultar(self, *args):
+        self.ids.s_r.clear_widgets()
+        f_texto = self.ids.f_s.text.upper()
+        f_spin  = (self.ids.stock_spinner.text.upper()
+                   if self.ids.stock_spinner.text != "BUSCAR MATERIAL" else "")
+        alertas_conf = {r[0].upper(): r[1] for r in db_query("SELECT material,stock_minimo FROM alertas_stock")}
+        mats = sorted({r[0] for r in db_query("SELECT DISTINCT UPPER(material) FROM movimientos") if r[0]})
+        for m in mats:
+            if f_spin and m != f_spin: continue
+            if not f_spin and f_texto and f_texto not in m: continue
+            fijo, disponible = obtener_stock_material(m)
+            minimo = alertas_conf.get(m, 5)
+            if disponible <= 0:        estado = "sin_stock"
+            elif disponible <= minimo: estado = "bajo"
+            else:                      estado = "ok"
+            if self._filtro_estado and estado != self._filtro_estado: continue
+            color_text = {'sin_stock':'#EF4444','bajo':'#F59E0B','ok':'#10B981'}[estado]
+            icono      = {'sin_stock':'','bajo':'','ok':''}[estado]
+            etiqueta   = {'sin_stock':'SIN STOCK','bajo':'STOCK BAJO','ok':'DISPONIBLE'}[estado]
+            color_card = {'sin_stock':'#450A0A','bajo':'#3B2000','ok':'#1E293B'}[estado]
+            card = crear_tarjeta(dp(100), color_card)
+            card.add_widget(Label(text=f"[b]{m}[/b]", markup=True,
+                                  color=get_color_from_hex('#38BDF8')))
+            card.add_widget(Label(text=f"Total sistema: {fijo}  |  Mínimo alerta: {minimo}"))
+            card.add_widget(Label(
+                text=f"[b][color={color_text}]{icono} {etiqueta}: {disponible}[/color][/b]",
+                markup=True
+            ))
+            self.ids.s_r.add_widget(card)
+
+
+class EstadisticasScreen(Screen):
+    def on_enter(self):
+        self.cargar_estadisticas()
+        gc.collect()
+
+    def _crear_seccion(self, titulo, color_titulo='#38BDF8'):
+        lbl = Label(
+            text=f"\n{titulo}",
+            font_size='13sp', bold=True,
+            color=get_color_from_hex(color_titulo),
+            size_hint_y=None, height=dp(35),
+            halign='left', valign='bottom',
+            text_size=(Window.width * 0.85, None),
+        )
+        return lbl
+
+    def _crear_barra(self, label, valor, maximo, color='#38BDF8'):
+        """
+        Crea una barra de progreso horizontal con label.
+        FIX: El BoxLayout spacer al final del bar_bg tenía size_hint_x=None implícito
+        lo que hacía que la barra ocupara todo el ancho sin dejar espacio al fill.
+        Se reemplaza el spacer por un Widget con size_hint_x=1 para que absorba
+        el espacio restante correctamente.
+        """
+        from kivy.uix.widget import Widget
+        row = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(38), padding=[dp(5),0])
+        row.add_widget(Label(
+            text=f"{label}:  {valor}",
+            font_size='11sp', color=get_color_from_hex('#CBD5E1'),
+            size_hint_y=None, height=dp(18),
+            halign='left', text_size=(Window.width * 0.8, None),
+        ))
+        bar_bg = BoxLayout(size_hint_y=None, height=dp(12))
+        with bar_bg.canvas.before:
+            Color(rgba=get_color_from_hex('#0F172A'))
+            bar_bg._rect = RoundedRectangle(pos=bar_bg.pos, size=bar_bg.size, radius=[dp(6)])
+        bar_bg.bind(
+            pos=lambda inst, val: setattr(bar_bg._rect, 'pos', val),
+            size=lambda inst, val: setattr(bar_bg._rect, 'size', val)
+        )
+
+        pct = min(valor / maximo, 1.0) if maximo > 0 else 0
+        bar_fill = BoxLayout(size_hint_x=max(pct, 0.02), size_hint_y=None, height=dp(12))
+        with bar_fill.canvas.before:
+            Color(rgba=get_color_from_hex(color))
+            bar_fill._rect = RoundedRectangle(pos=bar_fill.pos, size=bar_fill.size, radius=[dp(6)])
+        bar_fill.bind(
+            pos=lambda inst, val: setattr(bar_fill._rect, 'pos', val),
+            size=lambda inst, val: setattr(bar_fill._rect, 'size', val)
+        )
+
+        bar_bg.add_widget(bar_fill)
+        # FIX: Widget con size_hint_x=1 como spacer correcto para absorber espacio restante
+        bar_bg.add_widget(Widget(size_hint_x=1))
+        row.add_widget(bar_bg)
+        return row
+
+    def cargar_estadisticas(self):
+        self.ids.stats_container.clear_widgets()
+        stats   = obtener_reporte_estadisticas()
+        alertas = obtener_alertas_activas()
+
+        self.ids.stats_container.add_widget(self._crear_seccion("RESUMEN GENERAL", '#F59E0B'))
+
+        kpis = [
+            ("Total Movimientos",    stats["total_movimientos"], '#38BDF8'),
+            ("Entradas",             stats["entradas"],          '#10B981'),
+            ("Salidas",              stats["salidas"],           '#F87171'),
+            ("Materiales",           stats["materiales"],        '#A78BFA'),
+            ("Responsables",         stats["responsables"],      '#F59E0B'),
+            ("Movs. 7 días",          stats["movs_7dias"],        '#38BDF8'),
+            ("Movs. 30 días",         stats["movs_30dias"],       '#818CF8'),
+            ("Prom. cantidad",       stats["prom_cant"],         '#FB923C'),
+        ]
+        gl = GridLayout(cols=2, size_hint_y=None, spacing=dp(8))
+        gl.bind(minimum_height=gl.setter('height'))
+        for label, valor, color in kpis:
+            card = crear_tarjeta(dp(80))
+            card.add_widget(Label(text=label, font_size='11sp',
+                                  color=get_color_from_hex('#94A3B8')))
+            card.add_widget(Label(text=f"[b][color={color}]{valor}[/color][/b]",
+                                  markup=True, font_size='22sp'))
+            gl.add_widget(card)
+        self.ids.stats_container.add_widget(gl)
+
+        self.ids.stats_container.add_widget(self._crear_seccion("VOLUMENES MOVIDOS"))
+        card_vol = crear_tarjeta(dp(130))
+        card_vol.add_widget(Label(
+            text=f"Cantidad total entrada:  [b][color=#10B981]{stats['vol_entradas']}[/color][/b]",
+            markup=True, font_size='13sp', color=get_color_from_hex('#CBD5E1'),
+            size_hint_y=None, height=dp(28), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        card_vol.add_widget(Label(
+            text=f"Cantidad total salida:   [b][color=#F87171]{stats['vol_salidas']}[/color][/b]",
+            markup=True, font_size='13sp', color=get_color_from_hex('#CBD5E1'),
+            size_hint_y=None, height=dp(28), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        balance = stats['vol_entradas'] - stats['vol_salidas']
+        bal_color = '#10B981' if balance >= 0 else '#F87171'
+        card_vol.add_widget(Label(
+            text=f"Balance neto:  [b][color={bal_color}]{round(balance, 2)}[/color][/b]",
+            markup=True, font_size='14sp', color=get_color_from_hex('#F8FAFC'),
+            size_hint_y=None, height=dp(30), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        ratio = round(stats['entradas'] / max(stats['salidas'], 1), 2)
+        card_vol.add_widget(Label(
+            text=f"Ratio E/S:  [b][color=#818CF8]{ratio}[/color][/b]",
+            markup=True, font_size='12sp', color=get_color_from_hex('#94A3B8'),
+            size_hint_y=None, height=dp(24), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        self.ids.stats_container.add_widget(card_vol)
+
+        self.ids.stats_container.add_widget(self._crear_seccion("TENDENCIA 7 DIAS"))
+        card_trend = crear_tarjeta(dp(90))
+        max_7d = max(stats['ent_7d'], stats['sal_7d'], 1)
+        card_trend.add_widget(self._crear_barra("Entradas", stats['ent_7d'], max_7d, '#10B981'))
+        card_trend.add_widget(self._crear_barra("Salidas", stats['sal_7d'], max_7d, '#F87171'))
+        self.ids.stats_container.add_widget(card_trend)
+
+        if stats['top5_materiales']:
+            self.ids.stats_container.add_widget(self._crear_seccion("TOP 5 MATERIALES", '#A78BFA'))
+            max_cnt = stats['top5_materiales'][0][1] if stats['top5_materiales'] else 1
+            card_top = crear_tarjeta(dp(40 * len(stats['top5_materiales']) + 10))
+            for i, (m, cnt) in enumerate(stats['top5_materiales'], 1):
+                medal = ['*', '-', '-', '-', '-'][i-1]
+                colors = ['#F59E0B', '#94A3B8', '#94A3B8', '#64748B', '#64748B']
+                card_top.add_widget(self._crear_barra(f"{medal} {m}", cnt, max_cnt, colors[i-1]))
+            self.ids.stats_container.add_widget(card_top)
+
+        if stats['top5_responsables']:
+            self.ids.stats_container.add_widget(self._crear_seccion("TOP 5 RESPONSABLES", '#F59E0B'))
+            max_r = stats['top5_responsables'][0][1] if stats['top5_responsables'] else 1
+            card_resp = crear_tarjeta(dp(40 * len(stats['top5_responsables']) + 10))
+            for i, (n, cnt) in enumerate(stats['top5_responsables'], 1):
+                card_resp.add_widget(self._crear_barra(f"{i}. {n}", cnt, max_r, '#F59E0B'))
+            self.ids.stats_container.add_widget(card_resp)
+
+        if stats["material_top"] != "N/A":
+            card = crear_tarjeta(dp(70), '#0C4A6E')
+            card.add_widget(Label(text="Material más activo",
+                                  color=get_color_from_hex('#38BDF8'), font_size='12sp'))
+            card.add_widget(Label(text=f"[b]{stats['material_top']}[/b]",
+                                  markup=True, font_size='18sp',
+                                  color=get_color_from_hex('#FFFFFF')))
+            self.ids.stats_container.add_widget(card)
+
+        if alertas:
+            self.ids.stats_container.add_widget(self._crear_seccion(
+                f"ALERTAS DE STOCK ({len(alertas)})", '#F87171'
+            ))
+            card = crear_tarjeta(dp(30 + len(alertas)*30), '#450A0A')
+            for mat, disp, minimo in alertas:
+                card.add_widget(Label(
+                    text=f"  {mat}:  {disp}  (mín: {minimo})",
+                    font_size='12sp', color=get_color_from_hex('#FCA5A5'),
+                    size_hint_y=None, height=dp(26),
+                    halign='left', text_size=(Window.width*0.8, None)
+                ))
+            self.ids.stats_container.add_widget(card)
+
+        if stats['total_limpieza'] > 0:
+            self.ids.stats_container.add_widget(self._crear_seccion("LIMPIEZA", '#A78BFA'))
+            card_limp = crear_tarjeta(dp(90))
+            max_l = max(stats['limpios'], stats['sucios'], 1)
+            card_limp.add_widget(self._crear_barra("Limpios", stats['limpios'], max_l, '#10B981'))
+            card_limp.add_widget(self._crear_barra("Sucios", stats['sucios'], max_l, '#F59E0B'))
+            self.ids.stats_container.add_widget(card_limp)
+
+        if stats['mats_inactivos']:
+            self.ids.stats_container.add_widget(self._crear_seccion(
+                f"MATERIALES INACTIVOS (+30d):  {len(stats['mats_inactivos'])}", '#64748B'
+            ))
+            card_inact = crear_tarjeta(dp(20 + len(stats['mats_inactivos'])*24))
+            for m in stats['mats_inactivos']:
+                card_inact.add_widget(Label(
+                    text=f"  {m}", font_size='11sp',
+                    color=get_color_from_hex('#64748B'),
+                    size_hint_y=None, height=dp(22),
+                    halign='left', text_size=(Window.width*0.8, None)
+                ))
+            self.ids.stats_container.add_widget(card_inact)
+
+        self.ids.stats_container.add_widget(self._crear_seccion("SISTEMA", '#475569'))
+        card_sys = crear_tarjeta(dp(100))
+        card_sys.add_widget(Label(
+            text=f"Primer movimiento:  {stats['primer_mov']}",
+            font_size='11sp', color=get_color_from_hex('#64748B'),
+            size_hint_y=None, height=dp(22), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        card_sys.add_widget(Label(
+            text=f"Ultimo movimiento:  {stats['ultimo_mov']}",
+            font_size='11sp', color=get_color_from_hex('#64748B'),
+            size_hint_y=None, height=dp(22), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        try:
+            size_kb = os.path.getsize(DB_PATH) / 1024
+            card_sys.add_widget(Label(
+                text=f"Base de datos:  {size_kb:.1f} KB",
+                font_size='11sp', color=get_color_from_hex('#64748B'),
+                size_hint_y=None, height=dp(22), halign='left', text_size=(Window.width*0.8, None)
+            ))
+        except Exception:
+            pass
+        card_sys.add_widget(Label(
+            text=f"Version:  {VERSION_ACTUAL}",
+            font_size='11sp', color=get_color_from_hex('#64748B'),
+            size_hint_y=None, height=dp(22), halign='left', text_size=(Window.width*0.8, None)
+        ))
+        self.ids.stats_container.add_widget(card_sys)
+
+
+class AjustesScreen(Screen):
+    def on_enter(self):
+        self.actualizar_spinner_alertas()
+        try:
+            self.ids.lbl_carpeta_export.text = f"Carpeta: {EXPORT_DIR}"
+            self.ids.filtro_asunto.text    = EMAIL_CONFIG.get("asunto_filtro", "")
+            self.ids.filtro_remitente.text = EMAIL_CONFIG.get("remitente_filtro", "")
+        except Exception:
+            pass
+        gc.collect()
+
+    def actualizar_spinner_alertas(self):
+        mats = sorted({str(r[0]).upper() for r in db_query("SELECT DISTINCT material FROM movimientos") if r[0]})
+        self.ids.alerta_material_spinner.values = mats
+
+    def guardar_alerta(self):
+        mat    = (self.ids.alerta_material_spinner.text
+                  if self.ids.alerta_material_spinner.text != "SELECCIONAR MATERIAL" else "")
+        minimo = self.ids.stock_minimo_input.text.strip()
+        if not mat or not minimo:
+            self.ids.info_alerta.text = "Selecciona material y escribe mínimo"
+            return
+        try:
+            db_execute(
+                "INSERT INTO alertas_stock (material,stock_minimo) VALUES (?,?) "
+                "ON CONFLICT(material) DO UPDATE SET stock_minimo=excluded.stock_minimo",
+                (mat.upper(), float(minimo))
+            )
+            self.ids.info_alerta.text = f"Alerta guardada: {mat} → mín {minimo}"
+            self.ids.stock_minimo_input.text = ""
+        except Exception as e:
+            self.ids.info_alerta.text = f"Error: {e}"
+
+    def guardar_filtros_correo(self):
+        EMAIL_CONFIG["asunto_filtro"]    = self.ids.filtro_asunto.text.strip()
+        EMAIL_CONFIG["remitente_filtro"] = self.ids.filtro_remitente.text.strip()
+        self.ids.info_ajustes.text = "Filtros de correo guardados (sesión actual)"
+
+    def exportar_csv(self):
+        try:
+            nombre = ruta_exportacion(f"inventario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            rows   = db_query("SELECT nombre,material,sku,cantidad,tipo,fecha,stock_registro,dias,retorno,notas,ubicacion FROM movimientos")
+            with open(nombre, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(["Responsable","Material","SKU","Cantidad","Tipo","Fecha",
+                             "Stock","Días","Retorno","Notas","Ubicación"])
+                w.writerows(rows)
+            log_auditoria("EXPORT_CSV", nombre)
+            self.ids.info_ajustes.text = f"CSV guardado en:\n{nombre}"
+        except Exception as e:
+            self.ids.info_ajustes.text = f"Error: {e}"
+
+    def exportar_excel_local(self):
+        try:
+            nombre = ruta_exportacion(f"inventario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            generar_excel(nombre)
+            log_auditoria("EXPORT_XLSX", nombre)
+            self.ids.info_ajustes.text = f"Excel guardado en:\n{nombre}"
+        except Exception as e:
+            self.ids.info_ajustes.text = f"Error: {e}"
+
+    def confirmar_purga(self):
+        content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        pop = Popup(title="Confirmar Purga", content=content, size_hint=(0.88, 0.42))
+        content.add_widget(Label(
+            text="¿Eliminar movimientos de más de\n[b]90 días[/b]?\nEsta acción [b]NO[/b] se puede deshacer.",
+            markup=True, halign='center'
+        ))
+        btn = Button(text=" SÍ, PURGAR",
+                     background_color=get_color_from_hex('#991B1B'),
+                     size_hint_y=None, height=dp(45))
+        btn.bind(on_release=lambda x: self._ejecutar_purga(pop))
+        content.add_widget(btn)
+        content.add_widget(Button(text="Cancelar", size_hint_y=None, height=dp(40),
+                                   background_color=get_color_from_hex('#334155'),
+                                   on_release=pop.dismiss))
+        pop.open()
+
+    def _ejecutar_purga(self, pop):
+        try:
+            limite = (datetime.now() - timedelta(days=90)).strftime("%d/%m/%Y")
+            conn = sqlite3.connect(DB_PATH)
+            c    = conn.cursor()
+            c.execute("DELETE FROM movimientos WHERE fecha < ?", (limite,))
+            eliminados = c.rowcount
+            conn.commit()
+            conn.close()
+            log_auditoria("PURGA", f"{eliminados} registros eliminados (anteriores a {limite})")
+            pop.dismiss()
+            self.ids.info_ajustes.text = f"{eliminados} registros eliminados"
+        except Exception as e:
+            pop.dismiss()
+            self.ids.info_ajustes.text = f"Error: {e}"
+
+
+# ─────────────────────────────────────────────
+#  PANTALLA IMPORTAR EXCEL
+# ─────────────────────────────────────────────
+class ImportarExcelScreen(Screen):
+
+    _columnas_excel = []
+
+    def on_enter(self):
+        self._columnas_excel = []
+        self.ids.preview_container.clear_widgets()
+        self.ids.btn_importar.disabled = True
+        self.ids.estado_importar.text  = "Pulsa EXPLORAR para buscar tu archivo Excel"
+        try:
+            self.ids.lbl_hint_carpeta.text = f"Reportes de la app en: {EXPORT_DIR}"
+        except Exception:
+            pass
+        gc.collect()
+
+    def abrir_explorador(self):
+        try:
+            explorador = ExploradorArchivos(callback=self._al_seleccionar_archivo)
+            explorador.open()
+        except Exception as e:
+            self.ids.estado_importar.text = f"[color=#F87171]Error al abrir explorador: {e}[/color]"
+
+    def _al_seleccionar_archivo(self, ruta):
+        self.ids.ruta_excel.text      = ruta
+        self.ids.estado_importar.text = f"[color=#10B981]Archivo seleccionado[/color]"
+        Clock.schedule_once(lambda dt: self.previsualizar(), 0.1)
+
+    def pegar_ruta(self):
+        try:
+            from kivy.core.clipboard import Clipboard
+            texto = Clipboard.paste()
+            if texto:
+                texto = texto.strip().strip('\n').strip('\r')
+                texto = texto.strip('"').strip("'").strip('\u201c').strip('\u201d')
+                self.ids.ruta_excel.text = texto
+        except Exception:
+            self.ids.estado_importar.text = "[color=#F87171]No se pudo acceder al portapapeles[/color]"
+
+    def previsualizar(self):
+        ruta = self._normalizar_ruta(self.ids.ruta_excel.text)
+        if not ruta:
+            self.ids.estado_importar.text = "[color=#F87171]Primero selecciona un archivo[/color]"
+            return
+        if not os.path.exists(ruta):
+            self.ids.estado_importar.text = (
+                f"[color=#F87171]Archivo no encontrado:\n{ruta}\n\n"
+                f"Los reportes de la app están en:\n{EXPORT_DIR}[/color]"
+            )
+            return
+        self.ids.ruta_excel.text       = ruta
+        self.ids.estado_importar.text  = "⏳ Leyendo archivo..."
+        self.ids.btn_importar.disabled = True
+        self.ids.preview_container.clear_widgets()
+        threading.Thread(target=self._leer_excel_seguro, args=(ruta,), daemon=True).start()
+
+    def _normalizar_ruta(self, ruta_raw):
+        if not ruta_raw:
+            return ""
+        ruta = ruta_raw.strip()
+        for ch in ('"', "'", '\u201c', '\u201d', '\u2018', '\u2019'):
+            ruta = ruta.strip(ch)
+        ruta = ruta.strip('\n').strip('\r').strip()
+        ruta = os.path.expanduser(ruta)
+        ruta = os.path.normpath(ruta)
+        return ruta
+
+    def _leer_excel_seguro(self, ruta):
+        try:
+            wb    = load_workbook(ruta, read_only=True, data_only=True)
+            hojas = wb.sheetnames
+            Clock.schedule_once(lambda dt: self._set_hojas(hojas))
+            hoja_sel    = self.ids.hoja_spinner.text
+            hoja_nombre = hoja_sel if hoja_sel in hojas else hojas[0]
+            ws          = wb[hoja_nombre]
+            filas       = list(ws.iter_rows(values_only=True))
+            wb.close()
+            if len(filas) < 2:
+                Clock.schedule_once(lambda dt: self._set_estado(
+                    "[color=#F87171]El archivo no tiene datos[/color]"
+                ))
+                return
+            encabezados = [str(h).strip() if h is not None else "" for h in filas[0]]
+            datos       = filas[1:]
+            Clock.schedule_once(lambda dt: self._mostrar_preview(encabezados, datos, hoja_nombre))
+        except MemoryError:
+            Clock.schedule_once(lambda dt: self._set_estado(
+                "[color=#F87171]Archivo demasiado grande[/color]"
+            ))
+        except Exception as e:
+            Clock.schedule_once(lambda dt: self._set_estado(
+                f"[color=#F87171]Error al leer el archivo: {e}[/color]"
+            ))
+
+    def _set_hojas(self, hojas):
+        self.ids.hoja_spinner.values = hojas
+        if self.ids.hoja_spinner.text == "— detectar —" and hojas:
+            self.ids.hoja_spinner.text = hojas[0]
+
+    def _set_estado(self, texto):
+        self.ids.estado_importar.text = texto
+
+    def _mostrar_preview(self, encabezados, datos, hoja_nombre):
+        self._columnas_excel = encabezados
+        self.ids.preview_container.clear_widgets()
+        mapeo_auto = {
+            'col_nombre':   ['nombre','responsable','name','usuario','resp'],
+            'col_material': ['material','producto','item','descripcion','description','mat'],
+            'col_sku':      ['sku','id','codigo','code','ref'],
+            'col_cantidad': ['cantidad','qty','quantity','cant'],
+            'col_tipo':     ['tipo','type','movimiento','movement'],
+            'col_fecha':    ['fecha','date','datetime','timestamp'],
+        }
+        enc_lower = [e.lower() for e in encabezados]
+        for campo, alternativas in mapeo_auto.items():
+            for alt in alternativas:
+                if alt in enc_lower:
+                    self.ids[campo].text = encabezados[enc_lower.index(alt)]
+                    break
+
+        card_enc = crear_tarjeta(dp(65), '#0F3460')
+        card_enc.add_widget(Label(
+            text=f"[b]Hoja:[/b] {hoja_nombre}  |  [b]Columnas:[/b] {len(encabezados)}",
+            markup=True, color=get_color_from_hex('#38BDF8'), font_size='13sp'
+        ))
+        card_enc.add_widget(Label(
+            text="  ".join(encabezados[:8]),
+            font_size='11sp', color=get_color_from_hex('#94A3B8')
+        ))
+        self.ids.preview_container.add_widget(card_enc)
+
+        total = len(datos)
+        for fila in datos[:10]:
+            vals = [str(v) if v is not None else "—" for v in fila]
+            card = crear_tarjeta(dp(48))
+            card.add_widget(Label(
+                text="  |  ".join(vals[:7]),
+                font_size='11sp', color=get_color_from_hex('#CBD5E1')
+            ))
+            self.ids.preview_container.add_widget(card)
+
+        resumen = f"[color=#10B981]{total} fila(s) listas — revisa el mapeo y pulsa IMPORTAR[/color]"
+        if total > 10:
+            resumen += f"  [color=#94A3B8](mostrando 10 de {total})[/color]"
+        self._set_estado(resumen)
+        self.ids.btn_importar.disabled = False
+
+    def importar(self):
+        ruta = self._normalizar_ruta(self.ids.ruta_excel.text)
+        if not ruta or not os.path.exists(ruta):
+            self.ids.estado_importar.text = (
+                f"[color=#F87171]Archivo no encontrado.\n"
+                f"Los reportes exportados están en:\n{EXPORT_DIR}[/color]"
+            )
+            return
+        self.ids.btn_importar.disabled = True
+        self.ids.estado_importar.text  = "⏳ Importando datos..."
+        threading.Thread(target=self._importar_worker, args=(ruta,), daemon=True).start()
+
+    def _importar_worker(self, ruta):
+        try:
+            wb          = load_workbook(ruta, read_only=True, data_only=True)
+            hoja_nombre = self.ids.hoja_spinner.text
+            if hoja_nombre not in wb.sheetnames:
+                hoja_nombre = wb.sheetnames[0]
+            ws    = wb[hoja_nombre]
+            filas = list(ws.iter_rows(values_only=True))
+            wb.close()
+            if len(filas) < 2:
+                Clock.schedule_once(lambda dt: self._set_estado(
+                    "[color=#F87171]No hay datos para importar[/color]"
+                ))
+                Clock.schedule_once(lambda dt: setattr(self.ids.btn_importar, 'disabled', False))
+                return
+            encabezados = [str(h).strip() if h is not None else "" for h in filas[0]]
+            enc_upper   = [e.upper() for e in encabezados]
+
+            def idx(campo_id):
+                nombre_col = self.ids[campo_id].text.strip().upper()
+                try:    return enc_upper.index(nombre_col)
+                except ValueError: return None
+
+            i_nombre   = idx('col_nombre')
+            i_material = idx('col_material')
+            i_sku      = idx('col_sku')
+            i_cantidad = idx('col_cantidad')
+            i_tipo     = idx('col_tipo')
+            i_fecha    = idx('col_fecha')
+
+            if i_material is None or i_cantidad is None:
+                Clock.schedule_once(lambda dt: self._set_estado(
+                    "[color=#F87171]Las columnas 'Material' y 'Cantidad' son obligatorias.[/color]"
+                ))
+                Clock.schedule_once(lambda dt: setattr(self.ids.btn_importar, 'disabled', False))
+                return
+
+            def celda(fila, i):
+                if i is None or i >= len(fila): return None
+                return fila[i]
+
+            conn   = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            insertados = errores = omitidos = 0
+            ahora = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+            for fila in filas[1:]:
+                try:
+                    nombre   = str(celda(fila, i_nombre)   or "INVENTARIO").strip().upper()
+                    material = str(celda(fila, i_material) or "").strip().upper()
+                    sku      = str(celda(fila, i_sku)      or "").strip()
+                    raw_cant = celda(fila, i_cantidad)
+                    raw_tipo = str(celda(fila, i_tipo)     or "ENTRADA").strip().upper()
+                    raw_fecha = celda(fila, i_fecha)
+
+                    if not material:
+                        omitidos += 1
+                        continue
+                    try:
+                        cantidad = float(str(raw_cant).replace(',', '.'))
+                    except (TypeError, ValueError):
+                        omitidos += 1
+                        continue
+                    if cantidad <= 0:
+                        omitidos += 1
+                        continue
+                    if any(k in raw_tipo for k in ['ENT','IN','ING','COMP']):
+                        tipo = "ENTRADA"
+                    elif any(k in raw_tipo for k in ['SAL','OUT','EGR','RET']):
+                        tipo = "SALIDA"
+                    else:
+                        tipo = "ENTRADA"
+                    if raw_fecha is None:
+                        fecha = ahora
+                    elif isinstance(raw_fecha, datetime):
+                        fecha = raw_fecha.strftime("%d/%m/%Y %H:%M")
+                    else:
+                        fecha = str(raw_fecha).strip() or ahora
+                    _, stock_actual = obtener_stock_material(material)
+                    nuevo_stock = round(
+                        stock_actual + (cantidad if tipo == "ENTRADA" else -cantidad), 4
+                    )
+                    cursor.execute(
+                        '''INSERT INTO movimientos
+                           (nombre,material,sku,cantidad,tipo,fecha,stock_registro,dias,retorno,notas,ubicacion)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                        (nombre, material, sku, cantidad, tipo, fecha,
+                         nuevo_stock, 0, "N/A", "Importado desde Excel", "")
+                    )
+                    insertados += 1
+                except Exception:
+                    errores += 1
+
+            conn.commit()
+            conn.close()
+            log_auditoria("IMPORTAR_EXCEL",
+                          f"{insertados} importadas, {errores} errores, {omitidos} omitidas")
+            # FIX: Faltaba el salto de línea \n entre el mensaje de completado
+            # y los contadores, causando que todo apareciera pegado en una sola línea.
+            resumen = (
+                f"[color=#10B981]Importación completada[/color]\n"
+                f"Insertados: [b]{insertados}[/b]  |  "
+                f"Omitidos: {omitidos}  |  Errores: {errores}"
+            )
+            Clock.schedule_once(lambda dt: self._finalizar(resumen))
+        except MemoryError:
+            Clock.schedule_once(lambda dt: self._set_estado(
+                "[color=#F87171]Memoria insuficiente.[/color]"
+            ))
+            Clock.schedule_once(lambda dt: setattr(self.ids.btn_importar, 'disabled', False))
+        except Exception as e:
+            Clock.schedule_once(lambda dt: self._set_estado(
+                f"[color=#F87171]Error crítico: {e}[/color]"
+            ))
+            Clock.schedule_once(lambda dt: setattr(self.ids.btn_importar, 'disabled', False))
+
+    def _finalizar(self, resumen):
+        self._set_estado(resumen)
+        self.ids.btn_importar.disabled = False
+        self.ids.preview_container.clear_widgets()
+        try:
+            App.get_running_app().root.get_screen('inventario').actualizar_spinners()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  APP PRINCIPAL
+# ─────────────────────────────────────────────
+class InventarioApp(App):
+    def build(self):
+        self.title = f"Gestión Inventario PRO v{VERSION_ACTUAL}"
+        Builder.load_string(KV)
+        sm = ScreenManager(transition=SlideTransition())
+        sm.add_widget(InventarioScreen(name='inventario'))
+        sm.add_widget(LimpiezaScreen(name='limpieza'))
+        sm.add_widget(PendientesScreen(name='pendientes'))
+        sm.add_widget(FiltroScreen(name='filtros'))
+        sm.add_widget(StockScreen(name='stock'))
+        sm.add_widget(EstadisticasScreen(name='estadisticas'))
+        sm.add_widget(AjustesScreen(name='ajustes'))
+        sm.add_widget(ImportarExcelScreen(name='importar'))
+        return sm
+
+    def on_pause(self):
+        return True
+
+    def on_stop(self):
+        gc.collect()
+
+
+if __name__ == "__main__":
+    try:
+        InventarioApp().run()
+    except Exception as e:
+        try:
+            ruta_err = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_main.txt")
+            with open(ruta_err, "w", encoding="utf-8") as f:
+                f.write(f"CRASH en __main__ {datetime.now()}\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        raise

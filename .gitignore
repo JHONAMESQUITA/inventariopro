@@ -4,5 +4,7 @@ __pycache__/
 bin/
 .buildozer/
 *.log
-*.bak
-crash_log.txt
+*.db
+*.txt
+.env
+!buildozer.spec

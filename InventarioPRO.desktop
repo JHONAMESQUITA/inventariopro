@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=Inventario PRO
-Comment=Gestion de inventario
-Exec=python3 %k/main.py
-Path=%k
-Icon=%k/icon.png
-Terminal=false
-Type=Application
-Categories=Office;
