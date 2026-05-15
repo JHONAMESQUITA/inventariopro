@@ -36,7 +36,7 @@ version = 3.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3==3.13.3,kivy==2.3.0,openpyxl,requests,python-dotenv,Pillow,fpdf2,imaplib2
+requirements = python3,kivy,openpyxl,requests,python-dotenv,Pillow,fpdf2,imaplib2
 
 # (str) Custom source folders for requirements
 # requirements.source.kivy = ./kivy
