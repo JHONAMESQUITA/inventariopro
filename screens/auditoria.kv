@@ -1,0 +1,70 @@
+#:import utils kivy.utils
+#:import dp kivy.metrics.dp
+
+<AuditoriaScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(8)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0A0A12')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            spacing: dp(8)
+            Label:
+                text: "AUDITORIA"
+                font_size: '16sp'
+                bold: True
+                color: utils.get_color_from_hex('#00D4FF')
+                halign: 'left'
+                valign: 'middle'
+                text_size: self.size
+            Button:
+                text: "VOLVER"
+                size_hint_x: None
+                width: dp(90)
+                font_size: '12sp'
+                background_color: utils.get_color_from_hex('#334155')
+                on_release: root.manager.current = 'inventario'
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(42)
+            spacing: dp(6)
+            TextInput:
+                id: filtro_accion
+                hint_text: "Filtrar por accion..."
+                multiline: False
+                font_size: '12sp'
+            TextInput:
+                id: filtro_usuario
+                hint_text: "Filtrar por usuario..."
+                multiline: False
+                font_size: '12sp'
+            Button:
+                text: "FILTRAR"
+                size_hint_x: None
+                width: dp(90)
+                font_size: '12sp'
+                background_color: utils.get_color_from_hex('#0066FF')
+                on_release: root.filtrar()
+
+        PaginationBar:
+            id: pagination
+            callback: root.cargar_log
+            page_size: 30
+
+        ScrollView:
+            GridLayout:
+                id: log_container
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(6)
+                padding: [0, dp(4)]

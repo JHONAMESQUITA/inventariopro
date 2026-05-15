@@ -1,0 +1,235 @@
+#:import utils kivy.utils
+#:import dp kivy.metrics.dp
+
+<ValorScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: [dp(15), 0, dp(15), dp(15)]
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0A0A12')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        Label:
+            text: "VALOR DEL INVENTARIO"
+            font_size: '16sp'
+            bold: True
+            color: utils.get_color_from_hex('#00D4FF')
+            size_hint_y: None
+            height: dp(40)
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+            padding: [dp(5), 0]
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: 1
+            spacing: dp(8)
+
+            Widget:
+                size_hint_y: 1
+
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(8)
+
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    spacing: dp(6)
+                    padding: dp(12)
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#0D1B2A')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(4)]
+                        Color:
+                            rgba: utils.get_color_from_hex('#1A2A4A')
+                        Line:
+                            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                            width: dp(1)
+                    Label:
+                        text: "ASIGNAR PRECIO DE VENTA"
+                        bold: True
+                        color: utils.get_color_from_hex('#00D4FF')
+                        size_hint_y: None
+                        height: dp(20)
+                        font_size: '11sp'
+                        halign: 'left'
+                        text_size: self.size
+                    Spinner:
+                        id: spinner_material
+                        text: "-- SELECCIONAR --"
+                        values: []
+                        size_hint_y: None
+                        height: dp(38)
+                        font_size: '12sp'
+                        on_text: root.actualizar_valor_unitario()
+                    BoxLayout:
+                        size_hint_y: None
+                        height: dp(38)
+                        spacing: dp(6)
+                        TextInput:
+                            id: input_precio
+                            hint_text: "Precio venta unitario ($ COP)"
+                            input_filter: 'int'
+                            multiline: False
+                            font_size: '13sp'
+                        Button:
+                            text: "ASIGNAR"
+                            size_hint_x: None
+                            width: dp(90)
+                            font_size: '11sp'
+                            background_color: utils.get_color_from_hex('#0066FF')
+                            on_release: root.asignar_precio()
+                    Label:
+                        id: info_valor
+                        text: ""
+                        color: utils.get_color_from_hex('#00D4FF')
+                        size_hint_y: None
+                        height: dp(18)
+                        font_size: '10sp'
+                        halign: 'left'
+                        text_size: self.size
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(38)
+                    spacing: dp(6)
+                    padding: [dp(10), 0]
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#0D1B2A')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(4)]
+                        Color:
+                            rgba: utils.get_color_from_hex('#1A2A4A')
+                        Line:
+                            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                            width: dp(1)
+                    Label:
+                        text: "VALOR UNITARIO:"
+                        font_size: '12sp'
+                        bold: True
+                        color: utils.get_color_from_hex('#E8EAED')
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_x: 0.5
+                    Label:
+                        id: unitario_label
+                        text: "$ 0"
+                        font_size: '16sp'
+                        bold: True
+                        color: utils.get_color_from_hex('#5A6A7A')
+                        halign: 'right'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_x: 0.5
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(38)
+                    spacing: dp(6)
+                    padding: [dp(10), 0]
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#0D1B2A')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(4)]
+                        Color:
+                            rgba: utils.get_color_from_hex('#1A2A4A')
+                        Line:
+                            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                            width: dp(1)
+                    Label:
+                        text: "VALOR TOTAL:"
+                        font_size: '12sp'
+                        bold: True
+                        color: utils.get_color_from_hex('#E8EAED')
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_x: 0.5
+                    Label:
+                        id: total_label
+                        text: "$ 0"
+                        font_size: '16sp'
+                        bold: True
+                        color: utils.get_color_from_hex('#5A6A7A')
+                        halign: 'right'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_x: 0.5
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(38)
+                    spacing: dp(6)
+                    padding: [dp(10), 0]
+                    canvas.before:
+                        Color:
+                            rgba: utils.get_color_from_hex('#0D1B2A')
+                        RoundedRectangle:
+                            pos: self.pos
+                            size: self.size
+                            radius: [dp(4)]
+                        Color:
+                            rgba: utils.get_color_from_hex('#1A2A4A')
+                        Line:
+                            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                            width: dp(1)
+                    Label:
+                        text: "VALOR TOTAL INVENTARIO:"
+                        font_size: '12sp'
+                        bold: True
+                        color: utils.get_color_from_hex('#E8EAED')
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_x: 0.5
+                    Label:
+                        id: total_inventario_label
+                        text: "$ 0"
+                        font_size: '16sp'
+                        bold: True
+                        color: utils.get_color_from_hex('#5A6A7A')
+                        halign: 'right'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_x: 0.5
+
+            Widget:
+                size_hint_y: 1
+
+        ScrollView:
+            id: scroll_items
+            size_hint_y: None
+            height: 0
+            GridLayout:
+                id: lista_valores
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(4)
+
+        Button:
+            text: "VOLVER"
+            size_hint_y: None
+            height: dp(42)
+            font_size: '12sp'
+            background_color: utils.get_color_from_hex('#0D1B2A')
+            color: utils.get_color_from_hex('#00D4FF')
+            on_release: root.manager.current = 'inventario'

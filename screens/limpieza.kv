@@ -1,0 +1,127 @@
+#:import utils kivy.utils
+#:import dp kivy.metrics.dp
+
+<LimpiezaScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(15)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: utils.get_color_from_hex('#0A0A12')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            padding: [dp(5), 0]
+            Label:
+                text: "CONTROL DE LIMPIEZA"
+                font_size: '18sp'
+                bold: True
+                halign: 'left'
+                text_size: self.size
+                valign: 'middle'
+                color: utils.get_color_from_hex('#00D4FF')
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_y: None
+            height: dp(310)
+            spacing: dp(8)
+            padding: dp(15)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#0D1B2A')
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(4)]
+                Color:
+                    rgba: utils.get_color_from_hex('#00D4FF')
+                Line:
+                    rounded_rectangle: [self.pos[0], self.pos[1], self.size[0], self.size[1], dp(4)]
+
+            Label:
+                text: "REGISTRAR ESTADO"
+                bold: True
+                font_size: '12sp'
+                color: utils.get_color_from_hex('#00D4FF')
+                size_hint_y: None
+                height: dp(20)
+                text_size: self.size
+                halign: 'left'
+
+            Spinner:
+                id: limpieza_spinner
+                text: "SELECCIONAR MATERIAL"
+                values: []
+                size_hint_y: None
+                height: dp(45)
+            TextInput:
+                id: m_n
+                hint_text: "O escribe material..."
+                multiline: False
+                size_hint_y: None
+                height: dp(45)
+            TextInput:
+                id: m_c
+                hint_text: "Cantidad"
+                input_filter: 'float'
+                multiline: False
+                size_hint_y: None
+                height: dp(45)
+            TextInput:
+                id: m_notas
+                hint_text: "Notas..."
+                multiline: False
+                size_hint_y: None
+                height: dp(45)
+            BoxLayout:
+                spacing: dp(10)
+                size_hint_y: None
+                height: dp(50)
+                Button:
+                    text: "LIMPIO"
+                    bold: True
+                    background_color: utils.get_color_from_hex('#0066FF')
+                    on_release: root.registrar_limpieza("LIMPIO")
+                Button:
+                    text: "SUCIO"
+                    bold: True
+                    background_color: utils.get_color_from_hex('#FF0044')
+                    on_release: root.registrar_limpieza("SUCIO")
+
+        Label:
+            id: info_limpieza
+            text: ""
+            color: utils.get_color_from_hex('#FF0044')
+            size_hint_y: None
+            height: dp(22)
+
+        TextInput:
+            id: f_l
+            hint_text: "Filtrar historial..."
+            multiline: False
+            size_hint_y: None
+            height: dp(45)
+            on_text: root.consultar_historial()
+
+        ScrollView:
+            GridLayout:
+                id: hist_limpieza
+                cols: 1
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(10)
+
+        Button:
+            text: "VOLVER AL INICIO"
+            size_hint_y: None
+            height: dp(50)
+            font_size: '14sp'
+            bold: True
+            background_color: utils.get_color_from_hex('#334155')
+            on_release: root.manager.current = 'inventario'

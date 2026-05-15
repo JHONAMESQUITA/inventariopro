@@ -1,0 +1,43 @@
+CRASH en __main__ 2026-05-14 19:10:07.250815
+Traceback (most recent call last):
+  File "C:\Users\sleyd\Documents\app\main.py", line 159, in <module>
+    InventarioApp().run()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\app.py", line 956, in run
+    runTouchApp()
+    ~~~~~~~~~~~^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\base.py", line 574, in runTouchApp
+    EventLoop.mainloop()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\base.py", line 339, in mainloop
+    self.idle()
+    ~~~~~~~~~^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\base.py", line 383, in idle
+    self.dispatch_input()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\base.py", line 334, in dispatch_input
+    post_dispatch_input(*pop(0))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\base.py", line 302, in post_dispatch_input
+    wid.dispatch('on_touch_up', me)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "kivy\\_event.pyx", line 731, in kivy._event.EventDispatcher.dispatch
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\uix\behaviors\button.py", line 179, in on_touch_up
+    self.dispatch('on_release')
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "kivy\\_event.pyx", line 727, in kivy._event.EventDispatcher.dispatch
+  File "kivy\\_event.pyx", line 1307, in kivy._event.EventObservers.dispatch
+  File "kivy\\_event.pyx", line 1191, in kivy._event.EventObservers._dispatch
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\lang\builder.py", line 60, in custom_callback
+    exec(__kvlang__.co_value, idmap)
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\sleyd\Documents\app\inventario.kv", line 85, in <module>
+    on_release: root.toggle_menu()
+    
+  File "C:\Users\sleyd\Documents\app\screens\inventario.py", line 125, in toggle_menu
+    self._construir_menu()
+    ~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\sleyd\Documents\app\screens\inventario.py", line 89, in _construir_menu
+    btn.canvas.after.add(inst.Color(0.153, 0.165, 0.22, 1))
+                         ^^^^^^^^^^
+AttributeError: module 'kivy.graphics.instructions' has no attribute 'Color'

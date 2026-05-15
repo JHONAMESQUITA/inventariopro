@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+bin/
+.buildozer/
+*.log
+*.bak
+crash_log.txt

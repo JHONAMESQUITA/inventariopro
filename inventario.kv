@@ -1,0 +1,516 @@
+#:import utils kivy.utils
+#:import dp kivy.metrics.dp
+
+<Button>:
+    background_normal: ''
+    background_down: ''
+    canvas.before:
+        Color:
+            rgba: self.background_color if self.state == 'normal' else [c * 0.6 for c in self.background_color]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(4)]
+
+<TextInput>:
+    background_normal: ''
+    background_active: ''
+    background_color: utils.get_color_from_hex('#0D1B2A')
+    foreground_color: utils.get_color_from_hex('#E8EAED')
+    cursor_color: utils.get_color_from_hex('#00D4FF')
+    hint_text_color: utils.get_color_from_hex('#5A6A7A')
+    padding: [dp(10), (self.height - self.line_height) / 2]
+    canvas.after:
+        Color:
+            rgba: utils.get_color_from_hex('#00D4FF') if self.focus else utils.get_color_from_hex('#1A2A4A')
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+            width: dp(1.5) if self.focus else dp(1)
+
+<SpinnerOption>:
+    background_normal: ''
+    background_color: utils.get_color_from_hex('#0D1B2A')
+    color: utils.get_color_from_hex('#E8EAED')
+    font_size: '13sp'
+
+<Spinner>:
+    background_normal: ''
+    background_down: ''
+    background_color: utils.get_color_from_hex('#0D1B2A')
+    color: utils.get_color_from_hex('#E8EAED')
+    font_size: '13sp'
+    option_cls: 'SpinnerOption'
+    canvas.before:
+        Color:
+            rgba: self.background_color
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(4)]
+        Color:
+            rgba: utils.get_color_from_hex('#1A2A4A')
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+            width: dp(1)
+
+<InventarioScreen>:
+    RelativeLayout:
+
+        BoxLayout:
+            id: main_area
+            orientation: 'vertical'
+            padding: dp(15)
+            spacing: dp(8)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#0A0A12')
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+
+            BoxLayout:
+                size_hint_y: None
+                height: dp(50)
+                spacing: dp(8)
+                padding: [dp(5), 0]
+                Button:
+                    id: btn_menu
+                    text: "MENU"
+                    size_hint_x: None
+                    width: dp(70)
+                    font_size: '12sp'
+                    bold: True
+                    background_color: utils.get_color_from_hex('#0D1B2A')
+                    color: utils.get_color_from_hex('#00D4FF')
+                    on_release: root.toggle_menu()
+                Widget:
+
+            ScrollView:
+                do_scroll_x: False
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(12)
+                    padding: [0, dp(6)]
+
+                    # Dashboard
+                    BoxLayout:
+                        orientation: 'vertical'
+                        size_hint_y: None
+                        height: dp(140)
+                        padding: dp(10)
+                        spacing: dp(6)
+                        canvas.before:
+                            Color:
+                                rgba: utils.get_color_from_hex('#0D1B2A')
+                            RoundedRectangle:
+                                pos: self.pos
+                                size: self.size
+                                radius: [dp(4)]
+                            Color:
+                                rgba: utils.get_color_from_hex('#00D4FF')
+                            Line:
+                                rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                                width: dp(1.5)
+                        canvas.after:
+                            Color:
+                                rgba: 0, 0.831, 1, 0.06
+                            Line:
+                                rounded_rectangle: (self.x - dp(2), self.y - dp(2), self.width + dp(4), self.height + dp(4), dp(4))
+                                width: dp(1)
+                        Label:
+                            id: lbl_saludo
+                            text: "Buenos dias"
+                            font_size: '11sp'
+                            color: utils.get_color_from_hex('#00D4FF')
+                            size_hint_y: None
+                            height: dp(18)
+                            text_size: self.size
+                            halign: 'left'
+                        Label:
+                            id: lbl_fecha_hoy
+                            text: ""
+                            font_size: '9sp'
+                            color: utils.get_color_from_hex('#5A6A7A')
+                            size_hint_y: None
+                            height: dp(14)
+                            text_size: self.size
+                            halign: 'left'
+                        BoxLayout:
+                            spacing: dp(8)
+                            size_hint_y: None
+                            height: dp(60)
+                            BoxLayout:
+                                orientation: 'vertical'
+                                canvas.before:
+                                    Color:
+                                        rgba: utils.get_color_from_hex('#0A0A12')
+                                    RoundedRectangle:
+                                        pos: self.pos
+                                        size: self.size
+                                        radius: [dp(4)]
+                                padding: [dp(4), dp(3)]
+                                Label:
+                                    id: stat_materiales
+                                    text: "0"
+                                    font_size: '18sp'
+                                    bold: True
+                                    color: utils.get_color_from_hex('#00D4FF')
+                                    size_hint_y: None
+                                    height: dp(28)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                                Label:
+                                    text: "MATERIALES"
+                                    font_size: '8sp'
+                                    color: utils.get_color_from_hex('#5A6A7A')
+                                    size_hint_y: None
+                                    height: dp(12)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                            BoxLayout:
+                                orientation: 'vertical'
+                                canvas.before:
+                                    Color:
+                                        rgba: utils.get_color_from_hex('#0A0A12')
+                                    RoundedRectangle:
+                                        pos: self.pos
+                                        size: self.size
+                                        radius: [dp(4)]
+                                padding: [dp(4), dp(3)]
+                                Label:
+                                    id: stat_movs_hoy
+                                    text: "0"
+                                    font_size: '18sp'
+                                    bold: True
+                                    color: utils.get_color_from_hex('#00D4FF')
+                                    size_hint_y: None
+                                    height: dp(28)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                                Label:
+                                    text: "MOV. HOY"
+                                    font_size: '8sp'
+                                    color: utils.get_color_from_hex('#5A6A7A')
+                                    size_hint_y: None
+                                    height: dp(12)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                            BoxLayout:
+                                orientation: 'vertical'
+                                canvas.before:
+                                    Color:
+                                        rgba: utils.get_color_from_hex('#0A0A12')
+                                    RoundedRectangle:
+                                        pos: self.pos
+                                        size: self.size
+                                        radius: [dp(4)]
+                                padding: [dp(4), dp(3)]
+                                Label:
+                                    id: stat_alertas
+                                    text: "0"
+                                    font_size: '18sp'
+                                    bold: True
+                                    color: utils.get_color_from_hex('#FF0044')
+                                    size_hint_y: None
+                                    height: dp(28)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                                Label:
+                                    text: "ALERTAS"
+                                    font_size: '8sp'
+                                    color: utils.get_color_from_hex('#5A6A7A')
+                                    size_hint_y: None
+                                    height: dp(12)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                            BoxLayout:
+                                orientation: 'vertical'
+                                canvas.before:
+                                    Color:
+                                        rgba: utils.get_color_from_hex('#0A0A12')
+                                    RoundedRectangle:
+                                        pos: self.pos
+                                        size: self.size
+                                        radius: [dp(4)]
+                                padding: [dp(4), dp(3)]
+                                Label:
+                                    id: stat_pendientes
+                                    text: "0"
+                                    font_size: '18sp'
+                                    bold: True
+                                    color: utils.get_color_from_hex('#FF0044')
+                                    size_hint_y: None
+                                    height: dp(28)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                                Label:
+                                    text: "FUERA"
+                                    font_size: '8sp'
+                                    color: utils.get_color_from_hex('#5A6A7A')
+                                    size_hint_y: None
+                                    height: dp(12)
+                                    text_size: self.size
+                                    halign: 'center'
+                                    valign: 'middle'
+                    Label:
+                        id: lbl_resumen_db
+                        text: ""
+                        font_size: '9sp'
+                        color: utils.get_color_from_hex('#475569')
+                        size_hint_y: None
+                        height: dp(14)
+                        text_size: self.size
+                        halign: 'right'
+
+                    # Nuevo Movimiento
+                    BoxLayout:
+                        id: seccion_movimiento
+                        orientation: 'vertical'
+                        spacing: dp(6)
+                        padding: [dp(12), dp(5), dp(12), dp(10)]
+                        size_hint_y: None
+                        height: self.minimum_height
+                        canvas.before:
+                            Color:
+                                rgba: utils.get_color_from_hex('#0D1B2A')
+                            RoundedRectangle:
+                                pos: self.pos
+                                size: self.size
+                                radius: [dp(4)]
+                            Color:
+                                rgba: utils.get_color_from_hex('#1A2A4A')
+                            Line:
+                                rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                                width: dp(1)
+                        Label:
+                            text: "NUEVO MOVIMIENTO"
+                            bold: True
+                            font_size: '11sp'
+                            color: utils.get_color_from_hex('#00D4FF')
+                            size_hint_y: None
+                            height: dp(18)
+                            text_size: self.size
+                            halign: 'left'
+                        Spinner:
+                            id: responsable_spinner
+                            text: "SELECCIONAR RESPONSABLE"
+                            values: []
+                            size_hint_y: None
+                            height: dp(38)
+                        TextInput:
+                            id: nombre_nuevo
+                            hint_text: "O escribe nuevo responsable..."
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(38)
+                        Spinner:
+                            id: producto_spinner
+                            text: "SELECCIONAR MATERIAL"
+                            values: []
+                            size_hint_y: None
+                            height: dp(38)
+                        TextInput:
+                            id: producto_nuevo
+                            hint_text: "O escribe material nuevo..."
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(38)
+                        BoxLayout:
+                            spacing: dp(6)
+                            size_hint_y: None
+                            height: dp(38)
+                            TextInput:
+                                id: sku
+                                hint_text: "SKU / ID"
+                                multiline: False
+                            TextInput:
+                                id: cantidad
+                                hint_text: "Cantidad"
+                                input_filter: 'float'
+                                multiline: False
+                        BoxLayout:
+                            spacing: dp(6)
+                            size_hint_y: None
+                            height: dp(38)
+                            TextInput:
+                                id: d_p
+                                hint_text: "Dias (salida)"
+                                input_filter: 'int'
+                                multiline: False
+                            TextInput:
+                                id: ubicacion
+                                hint_text: "Ubicacion"
+                                multiline: False
+                        TextInput:
+                            id: f_m
+                            hint_text: "Fecha Manual (dd/mm/aaaa hh:mm)"
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(38)
+                        TextInput:
+                            id: notas
+                            hint_text: "Notas / Observaciones..."
+                            multiline: False
+                            size_hint_y: None
+                            height: dp(38)
+                        BoxLayout:
+                            size_hint_y: None
+                            height: dp(32)
+                            spacing: dp(8)
+                            CheckBox:
+                                id: c_l
+                                active: False
+                                size_hint_x: None
+                                width: dp(36)
+                            Label:
+                                text: "Enviar a Limpieza (solo INVENTARIO)"
+                                halign: 'left'
+                                valign: 'middle'
+                                text_size: self.size
+                                font_size: '11sp'
+                                color: utils.get_color_from_hex('#94A3B8')
+                        BoxLayout:
+                            size_hint_y: None
+                            height: dp(36)
+                            spacing: dp(8)
+                            Button:
+                                text: "LIMPIAR CAMPOS"
+                                background_color: utils.get_color_from_hex('#334155')
+                                font_size: '11sp'
+                                on_release: root.limpiar_campos()
+                            Button:
+                                id: btn_deshacer
+                                text: "DESHACER"
+                                background_color: utils.get_color_from_hex('#7C3AED')
+                                font_size: '11sp'
+                                disabled: True
+                                on_release: root.deshacer_ultimo()
+
+                    Label:
+                        id: info_carpeta
+                        text: ""
+                        color: utils.get_color_from_hex('#5A6A7A')
+                        markup: True
+                        font_size: '9sp'
+                        size_hint_y: None
+                        height: dp(20)
+                        text_size: self.size
+                        halign: 'left'
+                        valign: 'middle'
+                        shorten: True
+                        shorten_from: 'left'
+                    Label:
+                        id: info
+                        text: "Listo"
+                        color: utils.get_color_from_hex('#5A6A7A')
+                        markup: True
+                        size_hint_y: None
+                        height: dp(30)
+                        text_size: self.size
+                        halign: 'left'
+                        valign: 'middle'
+
+                    # Acciones Rapidas
+                    BoxLayout:
+                        id: seccion_acciones
+                        orientation: 'vertical'
+                        size_hint_y: None
+                        height: dp(120)
+                        padding: dp(12)
+                        spacing: dp(8)
+                        canvas.before:
+                            Color:
+                                rgba: utils.get_color_from_hex('#0D1B2A')
+                            RoundedRectangle:
+                                pos: self.pos
+                                size: self.size
+                                radius: [dp(4)]
+                            Color:
+                                rgba: utils.get_color_from_hex('#1A2A4A')
+                            Line:
+                                rounded_rectangle: (self.x, self.y, self.width, self.height, dp(4))
+                                width: dp(1)
+                        Label:
+                            text: "ACCIONES RAPIDAS"
+                            bold: True
+                            font_size: '11sp'
+                            color: utils.get_color_from_hex('#00D4FF')
+                            size_hint_y: None
+                            height: dp(18)
+                            text_size: self.size
+                            halign: 'left'
+                        BoxLayout:
+                            spacing: dp(10)
+                            Button:
+                                text: "ENTRADA"
+                                font_size: '14sp'
+                                bold: True
+                                on_release: root.procesar("ENTRADA")
+                                background_color: utils.get_color_from_hex('#0066FF')
+                            Button:
+                                text: "SALIDA"
+                                font_size: '14sp'
+                                bold: True
+                                on_release: root.procesar("SALIDA")
+                                background_color: utils.get_color_from_hex('#FF0044')
+                            Button:
+                                text: "SALIDA CAT"
+                                font_size: '12sp'
+                                bold: True
+                                on_release: root.salida_por_categoria()
+                                background_color: utils.get_color_from_hex('#CC0033')
+
+        BoxLayout:
+            id: drawer_overlay
+            size_hint: 1, 1
+            opacity: 0
+            canvas.before:
+                Color:
+                    rgba: 0, 0, 0, 0.6
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+
+        BoxLayout:
+            id: drawer
+            orientation: 'vertical'
+            size_hint_x: 0.7
+            size_hint_y: 1
+            opacity: 0
+            padding: dp(15)
+            spacing: dp(6)
+            canvas.before:
+                Color:
+                    rgba: utils.get_color_from_hex('#0D1B2A')
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [0, dp(4), dp(4), 0]
+            Label:
+                text: "HERRAMIENTAS"
+                bold: True
+                font_size: '13sp'
+                color: utils.get_color_from_hex('#00D4FF')
+                size_hint_y: None
+                height: dp(38)
+                halign: 'left'
+                valign: 'middle'
+                text_size: self.size
+                padding: [dp(6), 0]
+            GridLayout:
+                id: menu_grid
+                cols: 1
+                spacing: dp(4)
+                size_hint_y: None
+                height: self.minimum_height
+
+

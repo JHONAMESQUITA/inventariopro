@@ -1,0 +1,25 @@
+CRASH 2026-05-14 19:19:53.255116
+Traceback (most recent call last):
+  File "C:\Users\sleyd\Documents\app\main.py", line 47, in <module>
+    Builder.load_string(f.read())
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\lang\builder.py", line 377, in load_string
+    parser = Parser(content=string, filename=fn)
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\lang\parser.py", line 483, in __init__
+    self.parse(content)
+    ~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\lang\parser.py", line 593, in parse
+    objects, remaining_lines = self.parse_level(0, lines)
+                               ~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\sleyd\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\kivy\lang\parser.py", line 666, in parse_level
+    raise ParserException(self, ln,
+                          'Invalid data after declaration')
+kivy.lang.parser.ParserException: Parser: File "<inline>", line 37:
+...
+     35:            canvas.before:
+     36:                Color:
+>>   37:rgba: utils.get_color_from_hex('#0D1B2A')
+     38:                RoundedRectangle:
+     39:                    pos: self.pos
+...
+Invalid data after declaration
