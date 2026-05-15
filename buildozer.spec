@@ -66,7 +66,8 @@ android.sdk = 34
 # android.ndk = 25.1.8937393
 
 # (bool) Use Android Studio build tools
-android.gradle_dependencies = 'com.android.support:support-annotations:28.0.0'
+# android.gradle_dependencies = 
+android.gradle_version = 8.7
 android.accept_sdk_license = True
 
 # (str) Android private storage path

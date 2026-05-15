@@ -25,15 +25,35 @@ jobs:
         run: |
           pip install buildozer cython
 
+      - name: Install Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle-8.7-bin.zip
+          echo "$PWD/gradle-8.7/bin" >> $GITHUB_PATH
+          echo "GRADLE_HOME=$PWD/gradle-8.7" >> $GITHUB_ENV
+
       - name: Build APK
+        id: build
         run: |
           export ANDROIDAPI=34
           export ANDROIDMINAPI=24
           rm -rf .buildozer
           buildozer android debug 2>&1 | tee build.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Buildozer failed with exit code $EXIT_CODE"
+            tail -100 build.log
+            exit $EXIT_CODE
+          fi
+          echo "--- Searching for APK ---"
+          find $PWD -name "*.apk" -type f 2>/dev/null || echo "No APK files found"
+          ls -la bin/ 2>/dev/null || echo "No bin directory"
+          echo "APK_PATH=$(find $PWD -name '*.apk' -type f | head -1)" >> $GITHUB_OUTPUT
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: inventariopro-apk
-          path: bin/*.apk
+          path: |
+            bin/*.apk
+            **/*.apk
